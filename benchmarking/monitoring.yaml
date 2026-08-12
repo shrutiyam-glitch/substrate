@@ -50,6 +50,33 @@ subjects:
   name: prometheus
   namespace: benchmarking
 ---
+# Mirror of the Role/RoleBinding above in ate-system, so the benchmarking
+# Prometheus can also discover annotated pods there (ate-api-server's :9090
+# and storebench's :9090).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: benchmarking-prometheus
+  namespace: ate-system
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: benchmarking-prometheus
+  namespace: ate-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: benchmarking-prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: benchmarking
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -66,6 +93,7 @@ data:
             namespaces:
               names:
                 - benchmarking
+                - ate-system
         relabel_configs:
           - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
             action: keep

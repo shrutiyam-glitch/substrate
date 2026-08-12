@@ -1,0 +1,157 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Open-loop store benchmark Job (cmd/ateapi/storebench). See README.md in
+# this directory for setup and usage; edit the args below per run (backend,
+# rps, dataset rung, mix).
+#
+# For --backend=postgres against Cloud SQL, first create the DSN secret:
+#   kubectl create secret generic storebench-dsn -n ate-system \
+#     --from-literal=dsn="postgresql://postgres:<PW>@10.25.0.3:5432/atepg?sslmode=require"
+#
+# Deploy with:  hack/run-tool.sh ko apply -f benchmarking/storebench/job.yaml
+# Results:      kubectl logs -n ate-system job/storebench -f
+# Re-run:       kubectl delete job -n ate-system storebench, edit, re-apply.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: storebench
+  namespace: ate-system
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: storebench
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: storebench
+        image: ko://github.com/agent-substrate/substrate/cmd/ateapi/storebench
+        args:
+        # --- pick the backend under test ---
+        - --backend=postgres
+        # For --backend=redis use the in-cluster Valkey mTLS wiring instead:
+        #   --redis-cluster-address=valkey-cluster.ate-system.svc:6379
+        #   --redis-ca-certs=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+        #   --redis-tls-server-name=valkey-cluster.ate-system.svc
+        #   --redis-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        # --- dataset rung (S: 10k/100/10; M: 100k/1000/100; L: 500k/5000/500) ---
+        - --actors=0
+        - --workers=10000
+        - --atespaces=1
+        - --worker-pools=1
+        # --- load profile ---
+        - --rps=5000
+        - --skip-load=false
+        - --load-only=true
+        - --seed-actor-prefix=cactor-
+        - --seed-worker-prefix=cworker-
+        - --seed-worker-sandbox-class=gvisor
+        - --seed-worker-active=true
+        - --seed-worker-labels=workload=benchmark-ateom
+        - --seed-worker-namespace=benchmark-workloads
+        - --seed-pool-prefix=benchmark-ateom
+        - --seed-template-namespace=benchmark-workloads
+        - --seed-template-name=sleep
+        - --actor-bytes=3000
+        - --worker-bytes=1000
+        - --snapshot-bytes=1000
+        - --duration=3m
+        - --warmup=1m
+        - --mix=actorupdate=100
+        - --key-dist=uniform
+        - --json-out=/dev/termination-log
+        ports:
+        - name: metrics
+          containerPort: 9090
+        env:
+        # "1" replaces per-write pg_notify with the worker_changes feed table
+        # (pg_notify's global commit serialization caps worker writes ~600/s).
+        - name: ATEPG_CHANGE_FEED
+          value: "0"
+        # "1" additionally appends actor create/update/delete events to the
+        # actor_changes table (write side only; no WatchActors exists yet).
+        - name: ATEPG_ACTOR_CHANGE_FEED
+          value: "0"
+        - name: STOREBENCH_POSTGRES_DSN
+          valueFrom:
+            secretKeyRef:
+              name: storebench-dsn
+              key: dsn
+              optional: true
+        volumeMounts:
+        - name: servicedns
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+          readOnly: true
+        resources:
+          requests:
+            cpu: "2"
+            memory: "2Gi"
+          limits:
+            cpu: "4"
+            memory: "4Gi"
+      volumes:
+      # podidentity: the client identity Valkey verifies. servicedns: ONLY
+      # the trust bundle (verifies Valkey's serving cert) — no podCertificate
+      # source, because the servicedns signer only issues serving certs to
+      # pods backing a Service, and this Job serves nothing; requesting one
+      # would leave the pod stuck in ContainerCreating forever.
+      # Both volumes are unused for --backend=postgres.
+      - name: servicedns
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: podidentity.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+---
+# Google Managed Prometheus collection: makes storebench metrics visible in
+# Cloud Monitoring / Metrics Explorer (as prometheus.googleapis.com/
+# storebench_*) with months of retention — unlike the in-cluster benchmarking
+# Prometheus, whose TSDB is ephemeral. Requires GMP managed collection on the
+# cluster (gmp-system namespace present).
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: storebench
+  namespace: ate-system
+spec:
+  selector:
+    matchLabels:
+      app: storebench
+  endpoints:
+  - port: metrics
+    interval: 15s
