@@ -132,7 +132,7 @@ func copyActorsAndSnapshots(ctx context.Context, pool *pgxpool.Pool, ds *dataset
 			if err != nil {
 				return fmt.Errorf("marshaling actor: %w", err)
 			}
-			actorRows = append(actorRows, []any{ref.Atespace, ref.Name, int64(1), int32(a.GetStatus()), ab})
+			actorRows = append(actorRows, []any{ref.Atespace, ref.Name, a.GetMetadata().GetUid(), int64(1), ab})
 
 			s := benchSnapshot(ref.Atespace, ref.Name)
 			s.Metadata = serverMetadata(ref.Atespace, ref.Name)
@@ -140,18 +140,18 @@ func copyActorsAndSnapshots(ctx context.Context, pool *pgxpool.Pool, ds *dataset
 			if err != nil {
 				return fmt.Errorf("marshaling snapshot: %w", err)
 			}
-			snapRows = append(snapRows, []any{ref.Atespace, ref.Name, ds.snapLocation(), sb})
+			snapRows = append(snapRows, []any{ref.Atespace, ref.Name, sb})
 		}
 
 		// ON CONFLICT is unavailable to COPY; resume-from-max plus atomic
 		// batches keeps duplicates impossible unless names were tampered with.
 		if _, err := pool.CopyFrom(ctx, pgx.Identifier{"actors"},
-			[]string{"atespace", "name", "version", "status", "proto"},
+			[]string{"atespace", "name", "uid", "version", "proto"},
 			pgx.CopyFromRows(actorRows)); err != nil {
 			return fmt.Errorf("COPY actors [%d,%d): %w", base, end, err)
 		}
 		if _, err := pool.CopyFrom(ctx, pgx.Identifier{"actor_snapshots"},
-			[]string{"atespace", "name", "location", "proto"},
+			[]string{"atespace", "name", "proto"},
 			pgx.CopyFromRows(snapRows)); err != nil {
 			return fmt.Errorf("COPY actor_snapshots [%d,%d): %w", base, end, err)
 		}
@@ -188,10 +188,10 @@ func copyWorkers(ctx context.Context, pool *pgxpool.Pool, ds *dataset) error {
 			if err != nil {
 				return fmt.Errorf("marshaling worker: %w", err)
 			}
-			rows = append(rows, []any{w.GetWorkerNamespace(), w.GetWorkerPool(), w.GetWorkerPod(), w.GetIp(), int64(1), wb})
+			rows = append(rows, []any{w.GetWorkerNamespace(), w.GetWorkerPool(), w.GetWorkerPod(), int64(1), wb})
 		}
 		if _, err := pool.CopyFrom(ctx, pgx.Identifier{"workers"},
-			[]string{"worker_namespace", "worker_pool", "worker_pod", "ip", "version", "proto"},
+			[]string{"worker_namespace", "worker_pool", "worker_pod", "version", "proto"},
 			pgx.CopyFromRows(rows)); err != nil {
 			return fmt.Errorf("COPY workers [%d,%d): %w", base, end, err)
 		}

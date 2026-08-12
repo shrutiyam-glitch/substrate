@@ -159,7 +159,7 @@ func load(ctx context.Context, st store.Interface, ds *dataset, concurrency int)
 			if _, err := st.CreateActor(gctx, benchActor(ref.Atespace, ref.Name)); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 				return fmt.Errorf("creating actor %s: %w", ref, err)
 			}
-			if _, err := st.CreateActorSnapshot(gctx, benchSnapshot(ref.Atespace, ref.Name), ds.snapLocation()); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+			if _, err := st.CreateActorSnapshot(gctx, benchSnapshot(ref.Atespace, ref.Name)); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 				return fmt.Errorf("creating snapshot %s: %w", ref, err)
 			}
 			return nil
@@ -296,17 +296,15 @@ func opActorGet(ctx context.Context, st store.Interface, ds *dataset, keys *keyP
 
 func opActorUpdate(ctx context.Context, st store.Interface, ds *dataset, keys *keyPicker, rec *recorder) {
 	ref := ds.actorRef(keys.actor())
-	current, err := st.GetActor(ctx, ref) // untimed setup read for the CAS version
-	if err != nil {
-		rec.recordSetupFailure("ActorUpdate")
-		return
-	}
-	updated := proto.Clone(current).(*ateapipb.Actor)
-	updated.WorkerSelector = &ateapipb.Selector{
-		MatchLabels: map[string]string{"bench": uuid.NewString()},
-	}
+	// The interface is now a server-side read-modify-write: the timed call
+	// includes the transactional locked read, the mutation, and the write.
 	start := time.Now()
-	_, err = st.UpdateActor(ctx, updated, current.GetMetadata().GetVersion())
+	_, err := st.UpdateActor(ctx, ref, func(dbActor *ateapipb.Actor) error {
+		dbActor.WorkerSelector = &ateapipb.Selector{
+			MatchLabels: map[string]string{"bench": uuid.NewString()},
+		}
+		return nil
+	})
 	rec.record("ActorUpdate", start, err)
 }
 
@@ -337,7 +335,7 @@ func opWorkerUpdate(ctx context.Context, st store.Interface, ds *dataset, keys *
 func opSnapGet(ctx context.Context, st store.Interface, ds *dataset, keys *keyPicker, rec *recorder) {
 	ref := ds.actorRef(keys.actor())
 	start := time.Now()
-	_, _, err := st.GetActorSnapshot(ctx, ref.Atespace, ref.Name)
+	_, err := st.GetActorSnapshot(ctx, ref.Atespace, ref.Name)
 	rec.record("SnapshotGet", start, err)
 }
 
@@ -345,7 +343,7 @@ func opSnapCreate(ctx context.Context, st store.Interface, ds *dataset, keys *ke
 	atespace := ds.atespaceName(keys.intn(ds.atespaces))
 	name := "snap-" + uuid.NewString()
 	start := time.Now()
-	_, err := st.CreateActorSnapshot(ctx, benchSnapshot(atespace, name), ds.snapLocation())
+	_, err := st.CreateActorSnapshot(ctx, benchSnapshot(atespace, name))
 	rec.record("SnapshotCreate", start, err)
 }
 
