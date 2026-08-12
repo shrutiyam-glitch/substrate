@@ -17,6 +17,7 @@ package atepg
 import (
 	"testing"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storecontract"
 )
 
@@ -24,4 +25,26 @@ import (
 // against a real PostgreSQL instance.
 func TestContractSuite(t *testing.T) {
 	storecontract.RunContractTests(t, setupPostgresStore)
+}
+
+// TestContractSuiteChangeFeed re-runs the contract with the polling
+// change-feed watcher replacing LISTEN/NOTIFY — including the watch event
+// delivery assertions.
+func TestContractSuiteChangeFeed(t *testing.T) {
+	storecontract.RunContractTests(t, func(t *testing.T) store.Interface {
+		p := setupPostgresPersistence(t)
+		p.changeFeed = true
+		return p
+	})
+}
+
+// TestContractSuiteAllFlags enables both feeds, proving the feed inserts
+// don't alter any CRUD semantics.
+func TestContractSuiteAllFlags(t *testing.T) {
+	storecontract.RunContractTests(t, func(t *testing.T) store.Interface {
+		p := setupPostgresPersistence(t)
+		p.changeFeed = true
+		p.actorChangeFeed = true
+		return p
+	})
 }

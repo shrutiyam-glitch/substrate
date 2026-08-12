@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
@@ -45,6 +46,22 @@ import (
 type Persistence struct {
 	pool    *pgxpool.Pool
 	lockTTL time.Duration
+
+	// changeFeed replaces per-write pg_notify with inserts into the
+	// worker_changes table plus a polling watcher (ATEPG_CHANGE_FEED=1).
+	// pg_notify serializes ALL notifying transactions' commits through a
+	// global lock (measured ceiling ~600 worker writes/s on Cloud SQL,
+	// regardless of instance size); feed inserts commit in parallel.
+	// Delivery-iff-commit is preserved: the feed row is written in the same
+	// transaction as the worker write. The watcher polls every
+	// changeFeedPollInterval; like LISTEN/NOTIFY, delivery is best-effort
+	// (consumers already heal via periodic relist).
+	changeFeed bool
+
+	// actorChangeFeed additionally appends actor create/update/delete events
+	// to the actor_changes table (ATEPG_ACTOR_CHANGE_FEED=1). Write side
+	// only: no WatchActors exists in store.Interface yet.
+	actorChangeFeed bool
 }
 
 var _ store.Interface = (*Persistence)(nil)
@@ -75,7 +92,12 @@ func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, erro
 	if err := applySchema(ctx, pool); err != nil {
 		return nil, err
 	}
-	return &Persistence{pool: pool, lockTTL: defaultLockTTL}, nil
+	return &Persistence{
+		pool:            pool,
+		lockTTL:         defaultLockTTL,
+		changeFeed:      os.Getenv("ATEPG_CHANGE_FEED") == "1",
+		actorChangeFeed: os.Getenv("ATEPG_ACTOR_CHANGE_FEED") == "1",
+	}, nil
 }
 
 // querier is satisfied by both *pgxpool.Pool and pgx.Tx, letting read helpers
@@ -262,10 +284,26 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
 
-	_, err = p.pool.Exec(ctx, `
-		INSERT INTO actors (atespace, name, uid, version, proto)
-		VALUES ($1, $2, $3, $4, $5)`,
-		atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes)
+	if p.actorChangeFeed {
+		payload, perr := marshalActorEvent(actorEventCreated, dbActor)
+		if perr != nil {
+			return nil, fmt.Errorf("marshaling actor event: %w", perr)
+		}
+		var one int
+		err = p.pool.QueryRow(ctx, `
+			WITH ins AS (
+				INSERT INTO actors (atespace, name, uid, version, proto)
+				VALUES ($1, $2, $3, $4, $5)
+				RETURNING 1
+			)
+			INSERT INTO actor_changes (payload) SELECT $6 FROM ins RETURNING 1`,
+			atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes, payload).Scan(&one)
+	} else {
+		_, err = p.pool.Exec(ctx, `
+			INSERT INTO actors (atespace, name, uid, version, proto)
+			VALUES ($1, $2, $3, $4, $5)`,
+			atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes)
+	}
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, store.ErrAlreadyExists
@@ -370,6 +408,16 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 		return nil, fmt.Errorf("updating actor %s/%s affected %d rows, want 1", atespace, name, commandTag.RowsAffected())
 	}
 
+	if p.actorChangeFeed {
+		payload, perr := marshalActorEvent(actorEventUpdated, dbActor)
+		if perr != nil {
+			return nil, fmt.Errorf("marshaling actor event: %w", perr)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO actor_changes (payload) VALUES ($1)`, payload); err != nil {
+			return nil, fmt.Errorf("appending actor change feed: %w", err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing actor update: %w", err)
 	}
@@ -407,6 +455,17 @@ func (p *Persistence) DeleteActor(ctx context.Context, actorRef resources.ActorR
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM actors WHERE atespace = $1 AND name = $2`, atespace, name); err != nil {
 		return nil, fmt.Errorf("deleting actor %s/%s: %w", atespace, name, err)
+	}
+	if p.actorChangeFeed {
+		payload, perr := marshalActorEvent(actorEventDeleted, &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: atespace, Name: name},
+		})
+		if perr != nil {
+			return nil, fmt.Errorf("marshaling actor event: %w", perr)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO actor_changes (payload) VALUES ($1)`, payload); err != nil {
+			return nil, fmt.Errorf("appending actor change feed: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing actor delete: %w", err)
@@ -838,6 +897,26 @@ const (
 	maxNotifyPayloadBytes = 8000
 )
 
+// actorEventEnvelope mirrors workerEventEnvelope for the actor feed.
+type actorEventEnvelope struct {
+	Type  int    `json:"t"`
+	Actor string `json:"a"` // protojson-encoded Actor (ref-only for deletes)
+}
+
+func marshalActorEvent(eventType int, actor *ateapipb.Actor) ([]byte, error) {
+	actorJSON, err := protojson.Marshal(actor)
+	if err != nil {
+		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
+	}
+	return json.Marshal(actorEventEnvelope{Type: eventType, Actor: string(actorJSON)})
+}
+
+const (
+	actorEventCreated = 1
+	actorEventUpdated = 2
+	actorEventDeleted = 3
+)
+
 type workerEventEnvelope struct {
 	Type   int    `json:"t"`
 	Worker string `json:"w"` // protojson-encoded Worker
@@ -887,11 +966,17 @@ func (p *Persistence) writeAndNotify(ctx context.Context, eventType store.Worker
 		if err != nil {
 			return fmt.Errorf("marshaling worker event: %w", err)
 		}
-		if len(payload) > maxNotifyPayloadBytes {
-			return fmt.Errorf("worker event payload of %d bytes exceeds PostgreSQL NOTIFY limit of %d bytes", len(payload), maxNotifyPayloadBytes)
-		}
-		if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, workerChangeChannel, string(payload)); err != nil {
-			return fmt.Errorf("notifying worker change: %w", err)
+		if p.changeFeed {
+			if _, err := tx.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, payload); err != nil {
+				return fmt.Errorf("appending worker change feed: %w", err)
+			}
+		} else {
+			if len(payload) > maxNotifyPayloadBytes {
+				return fmt.Errorf("worker event payload of %d bytes exceeds PostgreSQL NOTIFY limit of %d bytes", len(payload), maxNotifyPayloadBytes)
+			}
+			if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, workerChangeChannel, string(payload)); err != nil {
+				return fmt.Errorf("notifying worker change: %w", err)
+			}
 		}
 	}
 
@@ -1062,6 +1147,9 @@ func (p *Persistence) ListWorkers(ctx context.Context, pageSize int32, pageToken
 // worker-change channel, and forwards decoded notifications until the
 // context is cancelled or the caller closes the watch.
 func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, error) {
+	if p.changeFeed {
+		return p.watchWorkersFeed(ctx)
+	}
 	watchCtx, cancel := context.WithCancel(ctx)
 
 	poolConn, err := p.pool.Acquire(watchCtx)
@@ -1098,6 +1186,92 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 			case ch <- event:
 			case <-watchCtx.Done():
 				return
+			}
+		}
+	}()
+	return store.NewWorkerWatch(ch, cancel), nil
+}
+
+// changeFeedPollInterval bounds worker-event delivery latency in feed mode
+// (target is <=1s); changeFeedRetention is how far behind the cursor the
+// janitor keeps rows.
+const (
+	changeFeedPollInterval = 100 * time.Millisecond
+	changeFeedBatch        = 1024
+	changeFeedRetention    = int64(1_000_000)
+	changeFeedJanitorEvery = 600 // polls (~1 min)
+)
+
+// watchWorkersFeed is WatchWorkers in change-feed mode: poll worker_changes
+// past a cursor instead of LISTEN. Starts at the current max seq, so — like
+// LISTEN — only events after subscription are delivered.
+func (p *Persistence) watchWorkersFeed(ctx context.Context) (*store.WorkerWatch, error) {
+	watchCtx, cancel := context.WithCancel(ctx)
+
+	var cursor int64
+	if err := p.pool.QueryRow(watchCtx, `SELECT COALESCE(max(seq), 0) FROM worker_changes`).Scan(&cursor); err != nil {
+		cancel()
+		return nil, fmt.Errorf("reading worker change feed cursor: %w", err)
+	}
+
+	ch := make(chan store.WorkerEvent, 128)
+	go func() {
+		defer close(ch)
+		ticker := time.NewTicker(changeFeedPollInterval)
+		defer ticker.Stop()
+		polls := 0
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			rows, err := p.pool.Query(watchCtx, `
+				SELECT seq, payload FROM worker_changes
+				WHERE seq > $1 ORDER BY seq LIMIT $2`, cursor, changeFeedBatch)
+			if err != nil {
+				if watchCtx.Err() != nil {
+					return
+				}
+				// Transient poll failure: like a dropped LISTEN connection,
+				// but recoverable in place — keep the cursor, try again.
+				slog.WarnContext(watchCtx, "worker change feed poll failed", slog.Any("err", err))
+				continue
+			}
+			type feedRow struct {
+				seq     int64
+				payload []byte
+			}
+			var batch []feedRow
+			for rows.Next() {
+				var r feedRow
+				if err := rows.Scan(&r.seq, &r.payload); err != nil {
+					rows.Close()
+					slog.WarnContext(watchCtx, "worker change feed scan failed", slog.Any("err", err))
+					batch = nil
+					break
+				}
+				batch = append(batch, r)
+			}
+			rows.Close()
+			for _, r := range batch {
+				event, err := unmarshalWorkerEvent(string(r.payload))
+				if err != nil {
+					slog.ErrorContext(watchCtx, "worker event unmarshal failed", slog.Any("err", err))
+					cursor = r.seq
+					continue
+				}
+				select {
+				case ch <- event:
+					cursor = r.seq
+				case <-watchCtx.Done():
+					return
+				}
+			}
+			if polls++; polls%changeFeedJanitorEvery == 0 && cursor > changeFeedRetention {
+				if _, err := p.pool.Exec(watchCtx, `DELETE FROM worker_changes WHERE seq < $1`, cursor-changeFeedRetention); err != nil && watchCtx.Err() == nil {
+					slog.WarnContext(watchCtx, "worker change feed janitor failed", slog.Any("err", err))
+				}
 			}
 		}
 	}()
@@ -1250,7 +1424,7 @@ func (p *Persistence) releaseLease(ctx context.Context, key, token string) error
 // --- Debug ---
 
 func (p *Persistence) DebugClearAll(ctx context.Context) error {
-	if _, err := p.pool.Exec(ctx, `TRUNCATE atespaces, actors, actor_snapshots, actor_snapshot_tags, workers, leases`); err != nil {
+	if _, err := p.pool.Exec(ctx, `TRUNCATE atespaces, actors, actor_snapshots, actor_snapshot_tags, workers, leases, worker_changes, actor_changes`); err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
 	}
 	return nil

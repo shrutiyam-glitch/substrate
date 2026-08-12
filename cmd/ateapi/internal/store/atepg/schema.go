@@ -71,6 +71,24 @@ CREATE TABLE IF NOT EXISTS workers (
     PRIMARY KEY (worker_namespace, worker_pool, worker_pod)
 );
 
+-- Transactional change feed for worker watches (used when
+-- ATEPG_CHANGE_FEED=1). Plain inserts commit in parallel, unlike pg_notify,
+-- whose global commit serialization caps notifying writes at ~600/s.
+-- payload is the same JSON envelope the NOTIFY path carries.
+CREATE TABLE IF NOT EXISTS worker_changes (
+    seq      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload  bytea NOT NULL
+);
+
+-- Write-side actor change feed (ATEPG_ACTOR_CHANGE_FEED=1). No reader
+-- exists yet (store.Interface has no WatchActors); this exists to measure
+-- the write-side cost of feeding actor events and as the foundation for a
+-- future actor watch. No janitor either -- bench cleanup only.
+CREATE TABLE IF NOT EXISTS actor_changes (
+    seq      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payload  bytea NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS leases (
     key         text PRIMARY KEY,
     token       text NOT NULL,
