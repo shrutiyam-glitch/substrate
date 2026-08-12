@@ -1,0 +1,123 @@
+	// Graceful shutdown knobs. atelet is dialed directly by pod IP (not via a
+	// Service), so ateapi does not gate on pod readiness and no route-drain
+	// window is needed; drain-delay therefore defaults to 0. drain-timeout is
+	// long by default because Checkpoint/Restore stream multi-GiB snapshots to
+	// object storage and can take minutes — force-cancelling one mid-upload
+	// crashes the actor. The sum drain-delay+drain-timeout must fit within the
+	// pod's terminationGracePeriodSeconds, or the kubelet SIGKILLs first.
+
+
+// drainOnShutdown drives graceful shutdown when ctx is cancelled (SIGTERM or
+// interrupt): it marks the process not-ready, waits drain-delay while still
+// accepting work, then GracefulStop()s the gRPC server so in-flight RPCs finish.
+// If they run past drain-timeout it forcefully Stop()s. The returned channel
+// closes once shutdown completes, so main can block on it before exiting (and
+// letting the deferred tracer/meter flushes run). Mirrors ateapi's
+// drainOnShutdown.
+
+What the test proved
+
+  1. New build is live — steady-state /readyz=200, /healthz=200. The old build had no /readyz endpoint at all, so a 200 confirms the new atelet is running (plus the new pod
+  carries the readinessProbe and terminationGracePeriodSeconds: 330).
+
+  2. Readiness diverges correctly during drain — after SIGTERM, every poll showed /readyz=503 while /healthz=200:
+  t+5s: /readyz=503  /healthz=200
+  ...
+  t+19s: /readyz=503  /healthz=200
+  So a draining atelet reports NotReady but stays alive for liveness — exactly the intended behavior.
+
+  3. The drain sequence fires in order — the logs show the full lifecycle, and the 25s gap between the first two lines is the --drain-delay=25s being honored precisely:
+  17:49:54  Shutdown signal received; draining      ← SIGTERM caught
+  17:50:19  Starting gRPC drain                      ← 25s later (drain-delay)
+  17:50:19  Drain completed within deadline          ← GracefulStop returned (no in-flight RPC)
+  17:50:19  Shutdown complete                        ← main exited cleanly after <-drainDone
+
+  Commands I used
+
+  # 0. Deploy the new atelet build (was 11h-old pre-change image)
+  hack/install-ate-kind.sh --deploy-atelet
+
+  # 1. Verify new manifest landed
+  kubectl get ds atelet -n ate-system \
+    -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
+  kubectl get ds atelet -n ate-system \
+    -o jsonpath='{.spec.template.spec.terminationGracePeriodSeconds}'
+
+  # 2. Steady-state endpoints (port-forward from host; :9090 is plain HTTP)
+  POD=$(kubectl get pods -n ate-system -l app=atelet -o jsonpath='{.items[0].metadata.name}')
+  kubectl port-forward -n ate-system "$POD" 9090:9090 &
+  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9090/readyz    # 200
+  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9090/healthz   # 200
+
+  # 3. Make the drain window observable (drain-delay defaults to 0)
+  kubectl patch ds atelet -n ate-system --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--drain-delay=25s"}]'
+  kubectl rollout status ds/atelet -n ate-system
+
+  # 4. Deliver SIGTERM (distroless container has no shell/kill, so delete the pod)
+  kubectl logs -n ate-system "$POD" -f &                 # capture drain logs
+  kubectl port-forward -n ate-system "$POD" 9090:9090 &  # watch /readyz
+  kubectl delete pod -n ate-system "$POD" --wait=false
+  # poll: curl /readyz -> 503, /healthz -> 200 during the window
+
+  # 5. Revert
+  kubectl patch ds atelet -n ate-system --type=json \
+    -p='[{"op":"remove","path":"/spec/template/spec/containers/0/args/5"}]'
+  kubectl rollout status ds/atelet -n ate-system
+
+
+
+
+
+Testing - 
+
+  Reframe: the axis is "what is atelet doing when SIGTERM lands," not "what state is the actor in"
+
+  atelet is a node supervisor — it doesn't hold actor state. Its termination behavior depends entirely on which of its RPCs (Run / Checkpoint / Restore) is in-flight at the 
+  instant SIGTERM arrives, and how far along it is. The actor's state is just the context that determines whether an RPC is in-flight. So "actor is SUSPENDED" isn't really an
+  atelet-termination case — a SUSPENDED actor has no worker/node binding, so atelet is doing nothing for it (that's the idle case).
+
+  So the right question per case is: is there an in-flight RPC, which one, and what happens if it's (a) allowed to finish vs (b) force-cancelled at the timeout?
+
+  The cases
+
+  ┌─────┬────────────────────────────────┬──────────────────────────────┬─────────────────────────────────────────┬───────────────────────────────────────────────────────┐
+  │  #  │    What atelet is doing at     │  Graceful (finishes within   │      Force-stop (exceeds timeout)       │                         Risk                          │
+  │     │            SIGTERM             │        drain-timeout)        │                                         │                                                       │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ 1   │ Idle — actors already RUNNING  │ GracefulStop returns         │ n/a                                     │ Low. Running actors are unaffected — their own        │
+  │     │ on the node, or none           │ instantly → clean exit       │                                         │ SIGTERM is #517, not atelet                           │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │     │ Checkpoint in-flight (Suspend, │ Snapshot fully uploaded →    │ Upload aborted → actor CRASHED,         │ Highest — the TODO(#362) data-loss path               │
+  │ 2   │  EXTERNAL)                     │ actor SUSPENDED              │ snapshot lost                           │ (main.go:400). This is why drain-timeout defaults     │
+  │     │                                │                              │                                         │ long                                                  │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ 3   │ Pause in-flight (LOCAL         │ Local snapshot on node VM →  │ Aborted → crash                         │ High; and note a LOCAL snapshot is lost anyway if the │
+  │     │ checkpoint)                    │ PAUSED                       │                                         │  node itself is being deleted                         │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ 4   │ Restore in-flight (Resume)     │ Actor → RUNNING              │ Resume RPC fails → ateapi retries       │ Lower — recoverable, not a crash                      │
+  │     │                                │                              │ (client-driven forward recovery)        │                                                       │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ 5   │ Run in-flight (cold boot)      │ Actor → RUNNING              │ Run RPC fails → retried                 │ Lower — recoverable. The long phase is image          │
+  │     │                                │                              │                                         │ pull/unpack                                           │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ 6   │ Multiple concurrent RPCs (many │ All finish                   │ The global timeout applies — any        │ Timeout must cover the slowest, not the average       │
+  │     │  actors/node)                  │                              │ straggler past it is force-stopped      │                                                       │
+  ├─────┼────────────────────────────────┼──────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ 7   │ RPC arrives during the drain   │ Accepted if within           │ After GracefulStop, rejected            │ With atelet's drain-delay=0, effectively rejected     │
+  │     │ window                         │ drain-delay                  │ Unavailable → ateapi retries elsewhere  │ immediately — clean, no crash                         │
+  └─────┴────────────────────────────────┴──────────────────────────────┴─────────────────────────────────────────┴───────────────────────────────────────────────────────┘
+
+  Cases you didn't list but should include:
+  - #6 concurrency — atelet serves all actors on its node; a real node drain can have several checkpoints in flight at once, sharing one timeout budget.
+  - #7 new-RPC-during-drain — proves atelet stops accepting correctly (the "stop accepting new RPCs" half of the issue).
+  - Grace-period exceeded (misconfig) — if drain-delay + drain-timeout > terminationGracePeriodSeconds, the kubelet SIGKILLs first and the drain is truncated. This is a
+  config-correctness case (why we set grace=330 ≥ 0+5m).
+  - Non-SIGTERM death (OOM/segfault) — bypasses the drain entirely. Out of #719's scope, but a real operational scenario worth knowing the drain does not cover.
+
+  A secondary dimension cutting across #2–#5: snapshot scope (FULL vs DATA) and workload size determine how long the RPC takes, which decides whether force-stop even triggers.
+  That's exactly what bit us on kind — the tiny counter's checkpoint was sub-second (and here, broken), so there was no window.
+
+  Coverage today: case #1 was proven live; #2's force-stop is proven by the unit test. #3–#7 are the same drainOnShutdown mechanism with different in-flight RPCs, so the unit
+  test's two paths (finish-within vs force-after-timeout) generalize — but if you want belt-and-suspenders, the Restore/Run cases (#4/#5) are the safe ones to exercise live
+  because their abort is recoverable.

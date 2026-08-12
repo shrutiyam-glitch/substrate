@@ -1,0 +1,7 @@
+2026/08/10 23:25:48 INFO Starting run backend=postgres rps=250 duration=3m0s warmup=1m0s mix="workerget=100" key-dist=uniform single-statement-cas=true
+
+backend=postgres offered=250 rps achieved=250 rps (measured window 180s)
+dataset: 100000 actors / 1000 workers / 100 atespaces, key-dist=uniform
+
+op                   count     errs conflicts     p50ms     p90ms     p95ms     p99ms   p99.9ms     maxms
+WorkerGet            45000        0         0      1.26      1.40      1.45      1.61      3.45     12.29

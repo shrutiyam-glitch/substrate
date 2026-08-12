@@ -1,0 +1,25 @@
+{
+  "backend": "postgres",
+  "offered_rps": 250,
+  "achieved_rps": 250.01111111111112,
+  "duration_sec": 180,
+  "dataset_actors": 100000,
+  "dataset_workers": 1000,
+  "dataset_atespaces": 100,
+  "key_dist": "uniform",
+  "unfinished_at_cutoff": 0,
+  "ops": [
+    {
+      "op": "ActorUpdate",
+      "count": 45002,
+      "errors": 0,
+      "conflicts": 0,
+      "p50_ms": 3.237,
+      "p90_ms": 4.587,
+      "p95_ms": 4.87,
+      "p99_ms": 5.35,
+      "p999_ms": 7.445,
+      "max_ms": 16.807
+    }
+  ]
+}

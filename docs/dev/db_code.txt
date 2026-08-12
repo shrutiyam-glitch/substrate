@@ -1,0 +1,46 @@
+Here's the complete tour, with the architecture answers woven in.
+
+  Code map (all on your bench/cloudsql branch)
+
+  The contract — cmd/ateapi/internal/store/store.go: Interface defines every operation; note WatchWorkers at line 127 is the only watch method, and WorkerEvent/WorkerWatch (139–157) are the only event types. There is no WatchActors — that
+  absence is a design choice, explained below.
+
+  The Postgres implementation — cmd/ateapi/internal/store/atepg/:
+  - schema.go — the six original tables plus the two feed tables (worker_changes, actor_changes).
+  - atepg.go, in reading order:
+    - Actors: UpdateActor (line 354, the 4-RTT transactional path), updateActorFast (433, the 2-RTT flag path), plus CreateActor/DeleteActor above/below them with the gated actor-feed branches.
+    - The worker event machinery — the heart of your question: workerChangeChannel (968), writeAndNotify (1026), UpdateWorker (1112), updateWorkerFast (1162), WatchWorkers (1306, the LISTEN path), watchWorkersFeed (1365, the polling
+  path).
+    - Locks: AcquireLock (1444) and the lease renewal loop below it.
+
+  The consumers — cmd/ateapi/:
+  - main.go:145 — workercache.New(persistence, 5*time.Minute): the one and only caller of WatchWorkers.
+  - internal/workercache/workercache.go — subscribes, maintains the in-memory worker map, full relist every 5 min, resubscribe-with-backoff on watch loss.
+  - internal/controlapi/syncer.go (NewWorkerPoolSyncer, wired at main.go:158) — the main writer of workers: mirrors Kubernetes pods into the store.
+  - internal/controlapi/workflow_resume.go:289 — AssignWorkerStep.Execute: picks a worker from the cache, claims it with UpdateWorker CAS.
+  - internal/controlapi/workflow.go:311 — acquireActorLock: the lease usage around workflows.
+
+  The benchmark side: cmd/ateapi/storebench/ (main/bench/copyload/metrics), benchmarking/storebench/ (job.yaml, sweep.sh, plot.py, README).
+
+  Why only worker updates are affected by the NOTIFY ceiling
+
+  Pure code structure: every worker mutation is routed through writeAndNotify (atepg.go:1026) — CreateWorker, UpdateWorker, DeleteWorker all pass a closure into it, and it appends the pg_notify (or feed insert) to the transaction. Actor
+  mutations never touch that function — UpdateActor at 354 is plain SQL with no event emission of any kind (until the optional actor-feed flag). So the global commit-serialization cost of NOTIFY attaches to exactly three operations:
+  worker create/update/delete. That's the entire reason ActorUpdate's curve was flat at 2,000/s while WorkerUpdate hit a wall at ~600/s with byte-identical CAS logic — the wall lives in the event emission, not the update.
+
+  Why workers get a watch and actors don't
+
+  It comes down to who needs a global view versus a single row:
+
+  Workers: the scheduler needs all of them, fast, constantly. When ResumeActor runs, AssignWorkerStep must pick a suitable idle worker right now — it can't list a million worker rows per resume. So each ateapi replica keeps the entire
+  worker set in memory (workercache) and needs a change feed to keep that cache warm, because workers change from outside any given replica: the syncer (possibly on another replica) registers/removes them as Kubernetes pods churn, and
+  other replicas' workflows claim and release them. Cache + watch is the standard answer to "hot read path over shared, externally-mutated state."
+
+  Actors: every access is by key, and staleness is forbidden anyway. No component ever needs "all actors in memory" — a request concerns exactly one actor, and the handler does a 1 ms PK GetActor. More fundamentally, a cached actor would
+  be useless: the whole concurrency model is CAS (read the current version, write conditioned on it) plus per-actor leases — you must read fresh from the source of truth immediately before mutating, or your update fails the version check.
+  Cross-replica coordination on the same actor is handled by the lease (acquireActorLock), not by watching. And externally, the API deliberately exposes CRUDL with no watch RPC — clients poll or get. So there's no consumer for actor
+  events, which is why the interface never grew WatchActors, which is why actor writes never notified, which is why they were never subject to the ceiling.
+
+  The neat symmetry to close on: workers are a replicated read cache over shared mutable state (needs events), actors are request-scoped records under optimistic concurrency (events would add cost and no correctness). The benchmark found
+  the cost of getting that distinction's implementation wrong on the worker side — and the docs to read next in this flow, in order, are docs/dev/onboarding-actor-lifecycle.md (narrative of both flows) and the ateredis equivalents
+  (publishWorkerEvent/WatchWorkers in ateredis.go) if you want to see the same worker-only event pattern in the Valkey implementation it was ported from.

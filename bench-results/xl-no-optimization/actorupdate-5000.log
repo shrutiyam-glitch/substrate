@@ -1,0 +1,2 @@
+2026/08/11 15:00:35 INFO Starting run backend=postgres rps=5000 duration=3m0s warmup=1m0s mix="actorupdate=100" key-dist=uniform single-statement-cas=false change-feed=false actor-change-feed=false
+2026/08/11 15:01:41 ERROR run err="aborting: 200004 requests in flight (> --max-inflight=200000); the backend is saturated at 5000 rps"

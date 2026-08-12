@@ -12,7 +12,7 @@ the full `storecontract` suite (5 suite configurations × 44 subtests).
 | 1 | Worker change feed (replace per-update `pg_notify`) | `ATEPG_CHANGE_FEED=1` | implemented, contract-green | worker-write ceiling **~600/s → ≥2k/s**; p50 at 1k QPS **610 ms → 4.9 ms**; **required** to ever reach the O(10K) worker-write target |
 | 2 | Reduced-RTT CAS update | — | **measured, then REJECTED — code removed** | update p50 −25% was real but marginal in absolute terms (~1.3 ms) and rescued no requirement; simplicity won |
 | 3 | Explicit pool sizing + pool metrics | DSN `pool_max_conns` | config + storebench metrics | default pool collapsed the system at 5k mixed QPS; 32 conns restored it |
-| 4 | Actor change feed (write side) | `ATEPG_ACTOR_CHANGE_FEED=1` | implemented, speculative | no current consumer; foundation/cost-probe for a future WatchActors |
+| 4 | Actor change feed (write side) | — | **removed 2026-08-12** | no current consumer existed; deleted to keep the PR minimal (§4) |
 | — | Schema itself | — | **validated as-is** | HOT updates 99.5–100%, no volume effect S→M, all reads 3–4× inside target |
 
 ## 1. Worker change feed (the critical one)
@@ -111,15 +111,14 @@ pgxpool stats (acquired/max conns, empty-acquire count, acquire-wait time)
 from ateapi the way storebench now does. Watch Cloud SQL `max_connections`
 (~400 at 16 GB) vs replicas × pool size.
 
-## 4. Actor change feed (speculative)
+## 4. Actor change feed — built, then removed (2026-08-12)
 
-Write-side twin of #1 for actor create/update/delete (`actor_changes`
-table). **No current consumer** — there is no WatchActors in
-store.Interface and no component needs one (actors are request-scoped,
-CAS forces fresh reads, leases coordinate workflows). Exists to measure
-event-feeding cost on the hottest write path and as groundwork if actor
-watches are ever proposed. Keep off; delete freely if the PR should stay
-minimal.
+A write-side twin of #1 was implemented behind ATEPG_ACTOR_CHANGE_FEED and
+deleted once confirmed that **nothing consumes actor events**: there is no
+WatchActors in store.Interface and no component needs one (actors are
+request-scoped, CAS forces fresh reads, leases coordinate workflows). If
+actor watches are ever proposed, the worker feed (#1) is the pattern to
+copy — transactional outbox insert per mutation + polling watcher.
 
 ## Validated as-is (no change recommended)
 

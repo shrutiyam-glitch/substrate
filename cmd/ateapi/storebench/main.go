@@ -191,8 +191,7 @@ func main() {
 	slog.Info("Starting run", "backend", *backend, "rps", cfg.rps,
 		"duration", cfg.duration.String(), "warmup", cfg.warmup.String(),
 		"mix", *mixSpec, "key-dist", *keyDist,
-		"change-feed", os.Getenv("ATEPG_CHANGE_FEED") == "1",
-		"actor-change-feed", os.Getenv("ATEPG_ACTOR_CHANGE_FEED") == "1")
+		"change-feed", os.Getenv("ATEPG_CHANGE_FEED") == "1")
 	report, err := run(ctx, st, ds, cfg)
 	if err != nil {
 		fatal("run", err)

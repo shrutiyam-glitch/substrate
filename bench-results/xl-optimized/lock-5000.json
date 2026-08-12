@@ -1,0 +1,25 @@
+{
+  "backend": "postgres",
+  "offered_rps": 5000,
+  "achieved_rps": 5000.138888888889,
+  "duration_sec": 180,
+  "dataset_actors": 100000000,
+  "dataset_workers": 1000000,
+  "dataset_atespaces": 100000,
+  "key_dist": "uniform",
+  "unfinished_at_cutoff": 0,
+  "ops": [
+    {
+      "op": "LockAcquire",
+      "count": 925487,
+      "errors": 0,
+      "conflicts": 0,
+      "p50_ms": 5031.668,
+      "p90_ms": 5079.666,
+      "p95_ms": 5099.932,
+      "p99_ms": 5162.738,
+      "p999_ms": 5207.739,
+      "max_ms": 5246.851
+    }
+  ]
+}

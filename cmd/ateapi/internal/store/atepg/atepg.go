@@ -58,10 +58,6 @@ type Persistence struct {
 	// (consumers already heal via periodic relist).
 	changeFeed bool
 
-	// actorChangeFeed additionally appends actor create/update/delete events
-	// to the actor_changes table (ATEPG_ACTOR_CHANGE_FEED=1). Write side
-	// only: no WatchActors exists in store.Interface yet.
-	actorChangeFeed bool
 }
 
 var _ store.Interface = (*Persistence)(nil)
@@ -96,7 +92,6 @@ func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, erro
 		pool:            pool,
 		lockTTL:         defaultLockTTL,
 		changeFeed:      os.Getenv("ATEPG_CHANGE_FEED") == "1",
-		actorChangeFeed: os.Getenv("ATEPG_ACTOR_CHANGE_FEED") == "1",
 	}, nil
 }
 
@@ -284,26 +279,10 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
 
-	if p.actorChangeFeed {
-		payload, perr := marshalActorEvent(actorEventCreated, dbActor)
-		if perr != nil {
-			return nil, fmt.Errorf("marshaling actor event: %w", perr)
-		}
-		var one int
-		err = p.pool.QueryRow(ctx, `
-			WITH ins AS (
-				INSERT INTO actors (atespace, name, uid, version, proto)
-				VALUES ($1, $2, $3, $4, $5)
-				RETURNING 1
-			)
-			INSERT INTO actor_changes (payload) SELECT $6 FROM ins RETURNING 1`,
-			atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes, payload).Scan(&one)
-	} else {
-		_, err = p.pool.Exec(ctx, `
-			INSERT INTO actors (atespace, name, uid, version, proto)
-			VALUES ($1, $2, $3, $4, $5)`,
-			atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes)
-	}
+	_, err = p.pool.Exec(ctx, `
+		INSERT INTO actors (atespace, name, uid, version, proto)
+		VALUES ($1, $2, $3, $4, $5)`,
+		atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, store.ErrAlreadyExists
@@ -408,15 +387,6 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 		return nil, fmt.Errorf("updating actor %s/%s affected %d rows, want 1", atespace, name, commandTag.RowsAffected())
 	}
 
-	if p.actorChangeFeed {
-		payload, perr := marshalActorEvent(actorEventUpdated, dbActor)
-		if perr != nil {
-			return nil, fmt.Errorf("marshaling actor event: %w", perr)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO actor_changes (payload) VALUES ($1)`, payload); err != nil {
-			return nil, fmt.Errorf("appending actor change feed: %w", err)
-		}
-	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing actor update: %w", err)
@@ -455,17 +425,6 @@ func (p *Persistence) DeleteActor(ctx context.Context, actorRef resources.ActorR
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM actors WHERE atespace = $1 AND name = $2`, atespace, name); err != nil {
 		return nil, fmt.Errorf("deleting actor %s/%s: %w", atespace, name, err)
-	}
-	if p.actorChangeFeed {
-		payload, perr := marshalActorEvent(actorEventDeleted, &ateapipb.Actor{
-			Metadata: &ateapipb.ResourceMetadata{Atespace: atespace, Name: name},
-		})
-		if perr != nil {
-			return nil, fmt.Errorf("marshaling actor event: %w", perr)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO actor_changes (payload) VALUES ($1)`, payload); err != nil {
-			return nil, fmt.Errorf("appending actor change feed: %w", err)
-		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing actor delete: %w", err)
@@ -895,26 +854,6 @@ const (
 	// maxNotifyPayloadBytes reflects PostgreSQL's NOTIFY payload size limit.
 	// Writes fail rather than silently omit a notification if exceeded.
 	maxNotifyPayloadBytes = 8000
-)
-
-// actorEventEnvelope mirrors workerEventEnvelope for the actor feed.
-type actorEventEnvelope struct {
-	Type  int    `json:"t"`
-	Actor string `json:"a"` // protojson-encoded Actor (ref-only for deletes)
-}
-
-func marshalActorEvent(eventType int, actor *ateapipb.Actor) ([]byte, error) {
-	actorJSON, err := protojson.Marshal(actor)
-	if err != nil {
-		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
-	}
-	return json.Marshal(actorEventEnvelope{Type: eventType, Actor: string(actorJSON)})
-}
-
-const (
-	actorEventCreated = 1
-	actorEventUpdated = 2
-	actorEventDeleted = 3
 )
 
 type workerEventEnvelope struct {
@@ -1424,7 +1363,7 @@ func (p *Persistence) releaseLease(ctx context.Context, key, token string) error
 // --- Debug ---
 
 func (p *Persistence) DebugClearAll(ctx context.Context) error {
-	if _, err := p.pool.Exec(ctx, `TRUNCATE atespaces, actors, actor_snapshots, actor_snapshot_tags, workers, leases, worker_changes, actor_changes`); err != nil {
+	if _, err := p.pool.Exec(ctx, `TRUNCATE atespaces, actors, actor_snapshots, actor_snapshot_tags, workers, leases, worker_changes`); err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
 	}
 	return nil

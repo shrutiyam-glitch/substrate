@@ -1,0 +1,25 @@
+{
+  "backend": "postgres",
+  "offered_rps": 500,
+  "achieved_rps": 500.01666666666665,
+  "duration_sec": 180,
+  "dataset_actors": 100000,
+  "dataset_workers": 1000,
+  "dataset_atespaces": 100,
+  "key_dist": "uniform",
+  "unfinished_at_cutoff": 0,
+  "ops": [
+    {
+      "op": "WorkerUpdate",
+      "count": 89862,
+      "errors": 0,
+      "conflicts": 142,
+      "p50_ms": 4.662,
+      "p90_ms": 6.696,
+      "p95_ms": 7.329,
+      "p99_ms": 16.129,
+      "p999_ms": 45.053,
+      "max_ms": 53.638
+    }
+  ]
+}

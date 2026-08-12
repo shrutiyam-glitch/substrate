@@ -84,10 +84,6 @@ spec:
         # (pg_notify's global commit serialization caps worker writes ~600/s).
         - name: ATEPG_CHANGE_FEED
           value: "0"
-        # "1" additionally appends actor create/update/delete events to the
-        # actor_changes table (write side only; no WatchActors exists yet).
-        - name: ATEPG_ACTOR_CHANGE_FEED
-          value: "0"
         - name: STOREBENCH_POSTGRES_DSN
           valueFrom:
             secretKeyRef:

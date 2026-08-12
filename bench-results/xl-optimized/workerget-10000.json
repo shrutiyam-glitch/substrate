@@ -1,0 +1,25 @@
+{
+  "backend": "postgres",
+  "offered_rps": 10000,
+  "achieved_rps": 9998.055555555555,
+  "duration_sec": 180,
+  "dataset_actors": 100000000,
+  "dataset_workers": 1000000,
+  "dataset_atespaces": 100000,
+  "key_dist": "uniform",
+  "unfinished_at_cutoff": 0,
+  "ops": [
+    {
+      "op": "WorkerGet",
+      "count": 1799650,
+      "errors": 0,
+      "conflicts": 0,
+      "p50_ms": 1.763,
+      "p90_ms": 2.671,
+      "p95_ms": 6.613,
+      "p99_ms": 735.265,
+      "p999_ms": 964.505,
+      "max_ms": 987.535
+    }
+  ]
+}

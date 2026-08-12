@@ -1,0 +1,25 @@
+{
+  "backend": "postgres",
+  "offered_rps": 2000,
+  "achieved_rps": 2000.0555555555557,
+  "duration_sec": 180,
+  "dataset_actors": 100000,
+  "dataset_workers": 1000,
+  "dataset_atespaces": 100,
+  "key_dist": "uniform",
+  "unfinished_at_cutoff": 0,
+  "ops": [
+    {
+      "op": "SnapshotCreate",
+      "count": 360016,
+      "errors": 0,
+      "conflicts": 0,
+      "p50_ms": 3.954,
+      "p90_ms": 4.5,
+      "p95_ms": 4.706,
+      "p99_ms": 11.312,
+      "p999_ms": 254.709,
+      "max_ms": 321.713
+    }
+  ]
+}

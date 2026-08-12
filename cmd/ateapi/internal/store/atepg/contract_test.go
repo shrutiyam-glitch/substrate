@@ -38,13 +38,3 @@ func TestContractSuiteChangeFeed(t *testing.T) {
 	})
 }
 
-// TestContractSuiteAllFlags enables both feeds, proving the feed inserts
-// don't alter any CRUD semantics.
-func TestContractSuiteAllFlags(t *testing.T) {
-	storecontract.RunContractTests(t, func(t *testing.T) store.Interface {
-		p := setupPostgresPersistence(t)
-		p.changeFeed = true
-		p.actorChangeFeed = true
-		return p
-	})
-}
