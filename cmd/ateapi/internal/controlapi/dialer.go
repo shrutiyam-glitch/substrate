@@ -29,6 +29,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/lru"
@@ -49,6 +50,16 @@ const (
 	trustDomainName = "cluster.local"
 	ateletSA        = "atelet"
 )
+
+// WorkerRuntimeDialer resolves the atelet endpoint responsible for a worker.
+// The production implementation (AteletDialer) uses Kubernetes Pod informers
+// and per-pod mTLS; benchmarks may supply StaticAteletDialer, which routes
+// every worker to one atelet simulator (see
+// docs/dev/fake-lifecycle-testing.md).
+type WorkerRuntimeDialer interface {
+	DialForWorker(workerPodNamespace, workerPodName string) (*grpc.ClientConn, error)
+	DialForAteletOnNode(nodeName string) (*grpc.ClientConn, error)
+}
 
 // AteletDialer handles gRPC connections to Atelet pods.
 type AteletDialer struct {
@@ -222,4 +233,39 @@ func verifyAteletServerCert(bundle *x509bundle.Bundle, expectedID spiffeid.ID, e
 
 		return nil
 	}, nil
+}
+
+var _ WorkerRuntimeDialer = (*AteletDialer)(nil)
+
+// StaticAteletDialer routes every worker to one shared atelet endpoint,
+// ignoring worker identity. Benchmark-only: it lets resume/suspend flows run
+// against an atelet simulator with no worker pods in the cluster.
+type StaticAteletDialer struct {
+	conn *grpc.ClientConn
+}
+
+var _ WorkerRuntimeDialer = (*StaticAteletDialer)(nil)
+
+// NewStaticAteletDialer creates a dialer whose every DialForWorker returns a
+// shared insecure connection to address.
+func NewStaticAteletDialer(address string) (*StaticAteletDialer, error) {
+	conn, err := grpc.NewClient(
+		address,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("while creating static atelet client connection: %w", err)
+	}
+	return &StaticAteletDialer{conn: conn}, nil
+}
+
+// DialForWorker returns the shared simulator connection.
+func (d *StaticAteletDialer) DialForWorker(_, _ string) (*grpc.ClientConn, error) {
+	return d.conn, nil
+}
+
+// DialForAteletOnNode returns the shared simulator connection.
+func (d *StaticAteletDialer) DialForAteletOnNode(_ string) (*grpc.ClientConn, error) {
+	return d.conn, nil
 }

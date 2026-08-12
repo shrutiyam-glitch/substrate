@@ -33,6 +33,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
+// EDIT 
+
 // syncerWorkerCount is the number of goroutines draining the work queue. The
 // queue never hands the same key to two workers concurrently, so per-key
 // ordering is preserved.
@@ -58,6 +60,7 @@ type WorkerPoolSyncer struct {
 	workerInformer   cache.SharedIndexInformer
 	workerPoolLister listersv1alpha1.WorkerPoolLister
 	queue            workqueue.TypedRateLimitingInterface[workerKey]
+	skipStoredWorkerSweep bool
 }
 
 // NewWorkerPoolSyncer creates a new WorkerPoolSyncer.
@@ -68,6 +71,15 @@ func NewWorkerPoolSyncer(persistence store.Interface, workerInformer cache.Share
 		workerPoolLister: workerPoolLister,
 		queue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[workerKey]()),
 	}
+}
+
+// SkipStoredWorkerSweep disables Start's store-side orphan sweep. BENCHMARK
+// ONLY: synthetic worker fleets (store rows with no pods — see
+// docs/dev/fake-lifecycle-testing.md) are indistinguishable from orphans, so
+// the sweep would delete them at every restart. Pod-event-driven cleanup
+// stays active; only missed-delete recovery across restarts is lost.
+func (s *WorkerPoolSyncer) SkipStoredWorkerSweep() {
+	s.skipStoredWorkerSweep = true
 }
 
 // Start registers the event handlers and starts the background workers. The
@@ -125,7 +137,11 @@ func (s *WorkerPoolSyncer) Start(ctx context.Context) {
 		// the resync period can replay a delete across a process restart,
 		// because the informer cache starts empty. Runs after the cache sync so
 		// the indexer is an authoritative snapshot of live pods.
-		s.enqueueStoredWorkers(ctx)
+		if s.skipStoredWorkerSweep {
+			slog.WarnContext(ctx, "BENCHMARK MODE: skipping stored-worker orphan sweep; synthetic workers persist across restarts")
+		} else {
+			s.enqueueStoredWorkers(ctx)
+		}
 
 		<-ctx.Done()
 	}()

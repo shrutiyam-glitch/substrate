@@ -75,6 +75,7 @@ var (
 	redisClientCert     = pflag.String("redis-client-cert", "", "The file containing client TLS certificate/key credential bundle for Redis/Valkey.")
 
 	storeBackend             = pflag.String("store-backend", "redis", "The persistence backend to use: redis|postgres.")
+	ateletSimulatorAddress   = pflag.String("atelet-simulator-address", "", "Route all worker runtime RPCs to this static atelet endpoint instead of per-pod discovery. BENCHMARK-ONLY (see docs/dev/fake-lifecycle-testing.md); empty uses production Kubernetes atelet discovery.")
 	postgresConnectionString = pflag.String("postgres-connection-string", "", "PostgreSQL connection string (libpq DSN or URI), used when --store-backend=postgres.")
 
 	clientJWTIssuer      = pflag.String("client-jwt-issuer", "", "The expected issuer URL for client JWTs.")
@@ -162,6 +163,9 @@ func main() {
 	storageClassLister := scInformerFactory.Storage().V1().StorageClasses().Lister()
 
 	syncer := controlapi.NewWorkerPoolSyncer(persistence, workerPodInformer, workerPoolLister)
+	if *ateletSimulatorAddress != "" {
+		syncer.SkipStoredWorkerSweep()
+	}
 	syncer.Start(ctx)
 
 	stopCh := make(chan struct{})
@@ -189,7 +193,17 @@ func main() {
 	}
 
 	volPlugins := make(map[string]volume.VolumePluginControlPlane)
-	ateletDialer := controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer(), *ateletClientCredBundle, *podIdentityCACerts)
+	var ateletDialer controlapi.WorkerRuntimeDialer
+	if *ateletSimulatorAddress != "" {
+		slog.WarnContext(ctx, "BENCHMARK MODE: routing all atelet RPCs to a simulator", slog.String("address", *ateletSimulatorAddress))
+		var derr error
+		ateletDialer, derr = controlapi.NewStaticAteletDialer(*ateletSimulatorAddress)
+		if derr != nil {
+			serverboot.Fatal(ctx, "Failed to build static atelet dialer", derr)
+		}
+	} else {
+		ateletDialer = controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer(), *ateletClientCredBundle, *podIdentityCACerts)
+	}
 	sm := controlapi.NewService(persistence, workerCache, actorTemplateLister, workerPoolLister, sandboxConfigLister, csiDriverConfigLister, storageClassLister, ateletDialer, clientset, instruments, *egressGatewayAddress, volPlugins)
 
 	jwtIssuerDiscoveryClient := buildK8sServiceAccountIssuerDiscoveryClient(ctx, *clientJWTCAFile, *clientJWTIssuer)
@@ -296,6 +310,7 @@ func loadFlagsFromEnv() {
 		{redisTLSServerName, "ATE_API_REDIS_TLS_SERVER_NAME"},
 		{redisClientCert, "ATE_API_REDIS_CLIENT_CERT"},
 		{storeBackend, "ATE_API_STORE_BACKEND"},
+		{ateletSimulatorAddress, "ATE_API_ATELET_SIMULATOR_ADDRESS"},
 		{postgresConnectionString, "ATE_API_POSTGRES_CONNECTION_STRING"},
 	}
 	for _, o := range overrides {
@@ -315,6 +330,7 @@ func logFlagValues(ctx context.Context) {
 		slog.String("redis-tls-server-name", *redisTLSServerName),
 		slog.String("redis-client-cert", *redisClientCert),
 		slog.String("store-backend", *storeBackend),
+		slog.String("atelet-simulator-address", *ateletSimulatorAddress),
 		slog.String("client-jwt-issuer", *clientJWTIssuer),
 		slog.String("client-jwt-audience", *clientJWTAudience),
 		slog.String("actor-id-jwt-pool", *actorIDJWTPoolFile),

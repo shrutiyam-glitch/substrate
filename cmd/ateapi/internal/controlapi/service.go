@@ -33,7 +33,7 @@ type Service struct {
 	ateapipb.UnimplementedControlServer
 	persistence           store.Interface
 	workerCache           *workercache.Cache
-	dialer                *AteletDialer
+	dialer                WorkerRuntimeDialer
 	actorTemplateLister   listersv1alpha1.ActorTemplateLister
 	workerPoolLister      listersv1alpha1.WorkerPoolLister
 	csiDriverConfigLister listersv1alpha1.CSIDriverConfigLister
@@ -60,7 +60,7 @@ func NewService(
 	sandboxConfigLister listersv1alpha1.SandboxConfigLister,
 	csiDriverConfigLister listersv1alpha1.CSIDriverConfigLister,
 	storageClassLister storagev1listers.StorageClassLister,
-	dialer *AteletDialer,
+	dialer WorkerRuntimeDialer,
 	kubeClient kubernetes.Interface,
 	instruments *Instruments,
 	egressGatewayAddress string,
