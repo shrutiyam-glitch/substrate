@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
@@ -79,6 +80,14 @@ func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, erro
 	}
 	janitorCtx, stopJanitor := context.WithCancel(context.Background())
 	p := &Persistence{pool: pool, lockTTL: defaultLockTTL, stopJanitor: stopJanitor}
+	// Cover the current and next hour before accepting writes; from then on
+	// the janitor keeps partitions ahead of the clock (and the DEFAULT
+	// partition catches writes if it ever falls behind).
+	now := time.Now().UTC()
+	if err := p.createWorkerChangesPartitions(ctx, now, now.Add(time.Hour)); err != nil {
+		stopJanitor()
+		return nil, err
+	}
 	go p.changeFeedJanitor(janitorCtx)
 	return p, nil
 }
@@ -1064,11 +1073,14 @@ func (p *Persistence) ListWorkers(ctx context.Context, pageSize int32, pageToken
 // changeFeedPollInterval bounds worker-event delivery latency (watch target
 // is <=1s). changeFeedBatch caps rows fetched per poll; a burst beyond it
 // carries over to the next poll (events are delayed, never dropped).
-// changeFeedRetentionAge is how long the janitor keeps feed rows; it must
-// comfortably exceed worst-case watcher lag, because a watcher that falls
-// behind it closes for resync (see WatchWorkers).
-// changeFeedJanitorInterval and changeFeedJanitorBatch pace the trim (see
-// changeFeedJanitor).
+// changeFeedRetentionAge is the minimum time the janitor keeps feed rows;
+// it must comfortably exceed worst-case watcher lag, because a watcher that
+// falls behind it closes for resync (see WatchWorkers). Retention operates
+// on whole hourly partitions, so a row actually lives between
+// changeFeedRetentionAge and changeFeedRetentionAge + 1h.
+// changeFeedJanitorInterval paces partition maintenance;
+// changeFeedJanitorBatch bounds the row-wise fallback trim of the DEFAULT
+// partition.
 const (
 	changeFeedPollInterval    = 100 * time.Millisecond
 	changeFeedBatch           = 1024
@@ -1077,15 +1089,16 @@ const (
 	changeFeedJanitorBatch    = 10_000
 )
 
-// changeFeedJanitor trims worker_changes by age on a fixed timer, for the
-// life of the Persistence. Retention is deliberately decoupled from watcher
-// cursors: keying deletes to any one watcher's position would let a fast
-// watcher delete rows a slower one has not consumed, and a janitor living
+// changeFeedJanitor maintains worker_changes partitions on a fixed timer,
+// for the life of the Persistence. Retention is deliberately decoupled from
+// watcher cursors: keying it to any one watcher's position would let a fast
+// watcher discard rows a slower one has not consumed, and a janitor living
 // inside a watcher goroutine never runs on a process holding no watch,
 // letting the table grow without bound (the write path always appends).
-// Deletes are batched so a backlog is reclaimed as a steady trickle rather
-// than one WAL/dead-tuple burst, and replicas elect one trimmer per batch
-// with a try-advisory lock.
+// Retention is a partition DROP — a metadata operation — so reclaiming even
+// a large backlog produces no delete/WAL/vacuum load competing with
+// foreground traffic (bulk row DELETEs measurably degrade update p99; see
+// the benchmarking ledger).
 func (p *Persistence) changeFeedJanitor(ctx context.Context) {
 	ticker := time.NewTicker(changeFeedJanitorInterval)
 	defer ticker.Stop()
@@ -1095,25 +1108,151 @@ func (p *Persistence) changeFeedJanitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		for {
-			n, err := p.trimWorkerChanges(ctx)
-			if err != nil {
-				if ctx.Err() == nil {
-					slog.WarnContext(ctx, "worker change feed janitor failed", slog.Any("err", err))
-				}
-				break
-			}
-			if n < changeFeedJanitorBatch {
-				break
-			}
+		if err := p.maintainWorkerChangesPartitions(ctx); err != nil && ctx.Err() == nil {
+			slog.WarnContext(ctx, "worker change feed janitor failed", slog.Any("err", err))
 		}
 	}
 }
 
-// trimWorkerChanges deletes one batch of feed rows older than
-// changeFeedRetentionAge. Returns the number of rows deleted; 0 without
-// error when another replica holds the janitor lock this round.
-func (p *Persistence) trimWorkerChanges(ctx context.Context) (int64, error) {
+// maintainWorkerChangesPartitions is one janitor pass: make sure the
+// current and next hourly partitions exist, drop partitions wholly past
+// retention, and trim any strays that landed in the DEFAULT partition.
+// Every step is idempotent, so concurrent replicas racing a pass is
+// harmless.
+func (p *Persistence) maintainWorkerChangesPartitions(ctx context.Context) error {
+	now := time.Now().UTC()
+	if err := p.createWorkerChangesPartitions(ctx, now, now.Add(time.Hour)); err != nil {
+		return err
+	}
+	if err := p.dropExpiredWorkerChangesPartitions(ctx, now); err != nil {
+		return err
+	}
+	for {
+		n, err := p.trimWorkerChangesDefault(ctx)
+		if err != nil {
+			return err
+		}
+		if n < changeFeedJanitorBatch {
+			return nil
+		}
+	}
+}
+
+func workerChangesPartitionName(hour time.Time) string {
+	return "worker_changes_p" + hour.UTC().Format("2006010215")
+}
+
+// createWorkerChangesPartitions idempotently creates the hourly partitions
+// covering the given instants. Serialized with an advisory lock: IF NOT
+// EXISTS does not close every concurrent-DDL race.
+func (p *Persistence) createWorkerChangesPartitions(ctx context.Context, hours ...time.Time) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning feed partition transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('agent-substrate-atepg-feed-partitions'))`); err != nil {
+		return fmt.Errorf("locking feed partition DDL: %w", err)
+	}
+	for _, h := range hours {
+		start := h.UTC().Truncate(time.Hour)
+		stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s PARTITION OF worker_changes FOR VALUES FROM ('%s') TO ('%s')`,
+			workerChangesPartitionName(start), start.Format(time.RFC3339), start.Add(time.Hour).Format(time.RFC3339))
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("creating feed partition for %s: %w", start, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing feed partition transaction: %w", err)
+	}
+	return nil
+}
+
+// dropExpiredWorkerChangesPartitions drops every hourly partition whose
+// entire range is older than retention. Each drop first records the
+// partition's greatest seq in worker_changes_trim, in the same transaction,
+// so watchers can detect exactly (not by inferring from identity gaps,
+// which rollbacks burn) that rows were discarded past their cursor.
+func (p *Persistence) dropExpiredWorkerChangesPartitions(ctx context.Context, now time.Time) error {
+	rows, err := p.pool.Query(ctx, `
+		SELECT c.relname FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_class parent ON parent.oid = i.inhparent
+		WHERE parent.relname = 'worker_changes'`)
+	if err != nil {
+		return fmt.Errorf("listing feed partitions: %w", err)
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning feed partition name: %w", err)
+		}
+		names = append(names, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("listing feed partitions: %w", err)
+	}
+
+	for _, name := range names {
+		suffix, ok := strings.CutPrefix(name, "worker_changes_p")
+		if !ok || suffix == "default" {
+			continue
+		}
+		start, err := time.Parse("2006010215", suffix)
+		if err != nil {
+			continue // not a partition this janitor manages
+		}
+		if now.Sub(start.Add(time.Hour)) < changeFeedRetentionAge {
+			continue
+		}
+		if err := p.dropWorkerChangesPartition(ctx, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *Persistence) dropWorkerChangesPartition(ctx context.Context, name string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning feed partition drop: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	// A concurrent replica may have dropped it between listing and here.
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists); err != nil {
+		return fmt.Errorf("checking feed partition %s: %w", name, err)
+	}
+	if !exists {
+		return nil
+	}
+	ident := pgx.Identifier{name}.Sanitize()
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO worker_changes_trim (seq)
+		SELECT max(seq) FROM %s HAVING count(*) > 0
+		ON CONFLICT (id) DO UPDATE SET seq = GREATEST(worker_changes_trim.seq, EXCLUDED.seq)`, ident)); err != nil {
+		return fmt.Errorf("recording trim mark for feed partition %s: %w", name, err)
+	}
+	if _, err := tx.Exec(ctx, `DROP TABLE `+ident); err != nil {
+		return fmt.Errorf("dropping feed partition %s: %w", name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing feed partition drop: %w", err)
+	}
+	return nil
+}
+
+// trimWorkerChangesDefault deletes one batch of aged rows from the DEFAULT
+// partition — the row-wise fallback for writes that landed there because no
+// hourly partition covered them (partition creation stalled). Empty in
+// normal operation. Returns rows deleted; 0 without error when another
+// replica holds the lock this round.
+func (p *Persistence) trimWorkerChangesDefault(ctx context.Context) (int64, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("beginning feed janitor transaction: %w", err)
@@ -1127,14 +1266,11 @@ func (p *Persistence) trimWorkerChanges(ctx context.Context) (int64, error) {
 	if !elected {
 		return 0, nil
 	}
-	// Record the greatest deleted seq in the same transaction, so watchers
-	// can detect exactly (not by inferring from identity gaps, which
-	// rollbacks burn) that rows were trimmed past their cursor.
 	var n int64
 	if err := tx.QueryRow(ctx, `
 		WITH doomed AS (
-			DELETE FROM worker_changes WHERE seq IN (
-				SELECT seq FROM worker_changes
+			DELETE FROM worker_changes_pdefault WHERE seq IN (
+				SELECT seq FROM worker_changes_pdefault
 				WHERE created_at < now() - make_interval(secs => $1)
 				ORDER BY seq LIMIT $2)
 			RETURNING seq
@@ -1145,7 +1281,7 @@ func (p *Persistence) trimWorkerChanges(ctx context.Context) (int64, error) {
 		)
 		SELECT count(*) FROM doomed`,
 		changeFeedRetentionAge.Seconds(), changeFeedJanitorBatch).Scan(&n); err != nil {
-		return 0, fmt.Errorf("trimming worker change feed: %w", err)
+		return 0, fmt.Errorf("trimming feed default partition: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("committing feed janitor transaction: %w", err)

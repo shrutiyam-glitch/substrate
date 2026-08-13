@@ -289,34 +289,59 @@ func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 	}
 }
 
-// TestTrimWorkerChanges_DeletesByAgeOnly verifies the janitor's age-based
-// retention: rows older than changeFeedRetentionAge are deleted, fresh rows
-// survive, independent of any watcher cursor.
-func TestTrimWorkerChanges_DeletesByAgeOnly(t *testing.T) {
+// TestWorkerChangesPartitionRetention verifies the janitor's partition-based
+// retention: an hourly partition wholly past changeFeedRetentionAge is
+// dropped (with its greatest seq recorded in worker_changes_trim), fresh
+// rows survive, and aged strays in the DEFAULT partition are trimmed by the
+// row-wise fallback.
+func TestWorkerChangesPartitionRetention(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
-	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO worker_changes (payload, created_at) VALUES
-			($1, now() - interval '1 hour'),
-			($1, now() - interval '20 minutes'),
-			($1, now())`, []byte("payload")); err != nil {
-		t.Fatalf("seeding feed rows failed: %v", err)
+	// A partition two hours back, holding one aged event.
+	stale := time.Now().UTC().Add(-2 * time.Hour)
+	if err := s.createWorkerChangesPartitions(ctx, stale); err != nil {
+		t.Fatalf("creating stale partition failed: %v", err)
+	}
+	var staleSeq int64
+	if err := s.pool.QueryRow(ctx, `INSERT INTO worker_changes (payload, created_at) VALUES ($1, $2) RETURNING seq`,
+		[]byte("old"), stale.Truncate(time.Hour).Add(time.Minute)).Scan(&staleSeq); err != nil {
+		t.Fatalf("inserting aged row failed: %v", err)
+	}
+	// An aged stray in the DEFAULT partition (no hourly partition covers a
+	// day ago), and a fresh row in the current partition.
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_changes (payload, created_at) VALUES ($1, now() - interval '1 day')`, []byte("stray")); err != nil {
+		t.Fatalf("inserting default-partition stray failed: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, []byte("fresh")); err != nil {
+		t.Fatalf("inserting fresh row failed: %v", err)
 	}
 
-	n, err := s.trimWorkerChanges(ctx)
-	if err != nil {
-		t.Fatalf("trimWorkerChanges failed: %v", err)
+	if err := s.maintainWorkerChangesPartitions(ctx); err != nil {
+		t.Fatalf("maintainWorkerChangesPartitions failed: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("trimWorkerChanges deleted %d rows, want 2 (the two older than retention)", n)
+
+	var staleExists bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`,
+		workerChangesPartitionName(stale)).Scan(&staleExists); err != nil {
+		t.Fatalf("checking stale partition failed: %v", err)
+	}
+	if staleExists {
+		t.Errorf("stale partition %s still exists, want dropped", workerChangesPartitionName(stale))
 	}
 	var remaining int
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM worker_changes`).Scan(&remaining); err != nil {
 		t.Fatalf("counting remaining rows failed: %v", err)
 	}
 	if remaining != 1 {
-		t.Errorf("%d rows remain, want 1 (the fresh row)", remaining)
+		t.Errorf("%d rows remain, want 1 (the fresh row; aged partition row and default stray gone)", remaining)
+	}
+	var trim int64
+	if err := s.pool.QueryRow(ctx, `SELECT seq FROM worker_changes_trim`).Scan(&trim); err != nil {
+		t.Fatalf("reading trim mark failed: %v", err)
+	}
+	if trim < staleSeq {
+		t.Errorf("trim mark %d does not cover dropped partition's seq %d", trim, staleSeq)
 	}
 }
 

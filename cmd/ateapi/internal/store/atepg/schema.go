@@ -75,28 +75,28 @@ CREATE TABLE IF NOT EXISTS workers (
 -- the same transaction as the worker write and delivered by polling past a
 -- (xid, seq) cursor;
 -- payload is a JSON envelope: {"t": <event type>, "w": <protojson Worker>}.
+--
+-- Partitioned hourly by created_at so retention is a partition DROP — a
+-- metadata operation with no row deletes, dead tuples, or vacuum debt —
+-- instead of bulk DELETEs whose I/O competes with foreground traffic. The
+-- janitor (changeFeedJanitor) creates upcoming partitions and drops expired
+-- ones; the DEFAULT partition only receives writes if partition creation
+-- ever stalls, and is trimmed row-wise as a fallback.
+--
+-- seq has no PRIMARY KEY: a unique constraint on a partitioned table must
+-- include the partition key, and uniqueness already holds by construction
+-- (one identity sequence). Requires PostgreSQL 17+ (identity column on a
+-- partitioned table).
 CREATE TABLE IF NOT EXISTS worker_changes (
-    seq         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    seq         bigint GENERATED ALWAYS AS IDENTITY,
     xid         xid8 NOT NULL DEFAULT pg_current_xact_id(),
     created_at  timestamptz NOT NULL DEFAULT now(),
     payload     bytea NOT NULL
-);
+) PARTITION BY RANGE (created_at);
 
 CREATE INDEX IF NOT EXISTS worker_changes_xid_seq ON worker_changes (xid, seq);
 
--- Every feed row is inserted once and deleted once ~retention later, making
--- this the highest-churn table in the schema. The default autovacuum
--- trigger (20% of live rows dead) lets millions of dead tuples accumulate
--- at high event rates; vacuum early and often instead.
-ALTER TABLE worker_changes SET (
-    autovacuum_vacuum_scale_factor = 0.05,
-    autovacuum_vacuum_cost_delay = 1
-);
-
--- BRIN: block-range summaries are nearly free to maintain on an append-only
--- table and let the janitor's age-based trim prune to old blocks only.
-CREATE INDEX IF NOT EXISTS worker_changes_created_at_brin
-    ON worker_changes USING brin (created_at);
+CREATE TABLE IF NOT EXISTS worker_changes_pdefault PARTITION OF worker_changes DEFAULT;
 
 -- Single-row high-water mark of the janitor's trim: the greatest seq ever
 -- deleted from worker_changes. Watchers compare it against their cursor to
