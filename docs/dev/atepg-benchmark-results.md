@@ -166,3 +166,32 @@ run-to-run variance of the 7.08/27.5 baseline; if anything faster) and this
 is the first 1M-worker run with p99 inside the <=10ms update target. The
 extra per-update work (2 column defaults + right-edge btree insert + BRIN)
 is invisible at 1k QPS.
+
+### Partitioned feed (hourly, retention = DROP PARTITION), 2026-08-13
+
+Feed partitioning (commit 5fa6d1ca) benchmarked after additive migration
+(worker_changes RENAMEd to worker_changes_legacy, rows preserved; index
+renamed too — index names are global and IF NOT EXISTS would have skipped
+the new partitioned index). Two runs, vacuum+checkpoint between:
+
+| run | p50 | p90 | p95 | p99 | conflicts |
+|---|---|---|---|---|---|
+| 1 | 7.02 | 7.81 | 8.11 | **9.83** | 3 |
+| 2 | 7.41 | 8.94 | 10.72 | 42.6 | 0 |
+
+Partition state after run 1: events in worker_changes_p2026081323
+(313 MB / ~240k rows = **1.30 KB/row measured**), next-hour partition
+pre-created empty, DEFAULT partition 0 bytes (routing never fell back).
+Worst-case arithmetic at the 10k events/s requirement ceiling: 36M
+rows/hour ≈ 47 GB/partition, 50–100 GB transient on disk — bounded,
+self-cleaning, reclaimed by metadata DROP. Slimming options if needed:
+binary-proto payload (−30–40%) and/or 15-min partitions (−3×).
+
+Run 2's tail is the recurring workers-table autovacuum alignment (240k
+updates/run vs the 200k default threshold — fires in-window whenever the
+run starts from a freshly vacuumed table), not the feed. Across all seven
+1M-worker runs: p50–p90 stable at 7–9 ms in every configuration; p99 is
+10 ms when the window is free of background maintenance and 40–70 ms when
+checkpoint/vacuum lands inside it. Partitioning removes the janitor's
+delete burst from that list of tail sources permanently (the p99-141ms
+catch-up case is now structurally impossible).
