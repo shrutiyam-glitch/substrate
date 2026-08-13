@@ -71,13 +71,40 @@ CREATE TABLE IF NOT EXISTS workers (
     PRIMARY KEY (worker_namespace, worker_pool, worker_pod)
 );
 
--- Transactional change feed for worker watches (used when
--- ATEPG_CHANGE_FEED=1). Plain inserts commit in parallel, unlike pg_notify,
--- whose global commit serialization caps notifying writes at ~600/s.
--- payload is the same JSON envelope the NOTIFY path carries.
+-- Transactional change feed backing WatchWorkers. Events are appended in
+-- the same transaction as the worker write and delivered by polling past a
+-- (xid, seq) cursor;
+-- payload is a JSON envelope: {"t": <event type>, "w": <protojson Worker>}.
 CREATE TABLE IF NOT EXISTS worker_changes (
-    seq      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    payload  bytea NOT NULL
+    seq         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    xid         xid8 NOT NULL DEFAULT pg_current_xact_id(),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    payload     bytea NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS worker_changes_xid_seq ON worker_changes (xid, seq);
+
+-- Every feed row is inserted once and deleted once ~retention later, making
+-- this the highest-churn table in the schema. The default autovacuum
+-- trigger (20% of live rows dead) lets millions of dead tuples accumulate
+-- at high event rates; vacuum early and often instead.
+ALTER TABLE worker_changes SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_vacuum_cost_delay = 1
+);
+
+-- BRIN: block-range summaries are nearly free to maintain on an append-only
+-- table and let the janitor's age-based trim prune to old blocks only.
+CREATE INDEX IF NOT EXISTS worker_changes_created_at_brin
+    ON worker_changes USING brin (created_at);
+
+-- Single-row high-water mark of the janitor's trim: the greatest seq ever
+-- deleted from worker_changes. Watchers compare it against their cursor to
+-- detect (exactly, without inferring from identity gaps) that unconsumed
+-- rows were trimmed out from under them.
+CREATE TABLE IF NOT EXISTS worker_changes_trim (
+    id   boolean PRIMARY KEY DEFAULT true CHECK (id),
+    seq  bigint NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS leases (

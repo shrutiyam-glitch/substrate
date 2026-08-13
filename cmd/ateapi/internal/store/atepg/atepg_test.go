@@ -114,6 +114,7 @@ func setupPostgresPersistence(t *testing.T) *Persistence {
 	if err != nil {
 		t.Fatalf("NewPersistence failed: %v", err)
 	}
+	t.Cleanup(p.Close)
 	if err := p.DebugClearAll(ctx); err != nil {
 		t.Fatalf("DebugClearAll failed: %v", err)
 	}
@@ -209,6 +210,180 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for event from a committed write")
+	}
+}
+
+// TestWatchWorkers_OutOfOrderCommitNotSkipped reproduces the seq-cursor gap:
+// feed seqs are allocated at INSERT but rows appear at COMMIT, so a
+// transaction holding a lower seq can commit after a higher-seq sibling. A
+// watcher whose cursor chased raw seq would advance past the in-flight row
+// and lose its event permanently. The (xid, seq) cursor must instead hold
+// the committed sibling back until the older transaction resolves, then
+// deliver both in order.
+func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
+	s := setupPostgresStore(t).(*Persistence)
+	ctx := context.Background()
+
+	watch, err := s.WatchWorkers(ctx)
+	if err != nil {
+		t.Fatalf("WatchWorkers failed: %v", err)
+	}
+	defer watch.Close()
+
+	mkPayload := func(pod string) []byte {
+		payload, err := marshalWorkerEvent(store.WorkerEventCreated,
+			&ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: pod})
+		if err != nil {
+			t.Fatalf("marshaling event for %q: %v", pod, err)
+		}
+		return payload
+	}
+
+	// tx1 appends first (lower seq, lower xid) and stays open.
+	tx1, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin tx1 failed: %v", err)
+	}
+	defer tx1.Rollback(ctx) //nolint:errcheck // no-op once committed
+	if _, err := tx1.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("first-seq-late-commit")); err != nil {
+		t.Fatalf("tx1 feed insert failed: %v", err)
+	}
+
+	// tx2 appends second (higher seq) and commits immediately.
+	tx2, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin tx2 failed: %v", err)
+	}
+	if _, err := tx2.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("second-seq-early-commit")); err != nil {
+		t.Fatalf("tx2 feed insert failed: %v", err)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("tx2 Commit failed: %v", err)
+	}
+
+	// While tx1 is in flight, tx2's committed event must be held back by
+	// the xmin fence — otherwise the cursor has already skipped tx1's row.
+	select {
+	case event := <-watch.Events:
+		t.Fatalf("event %q delivered while an older feed transaction was still in flight; its sibling event is now unreachable", event.Worker.GetWorkerPod())
+	case <-time.After(500 * time.Millisecond):
+		// Expected: fence holds both events back.
+	}
+
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("tx1 Commit failed: %v", err)
+	}
+
+	var got []string
+	for len(got) < 2 {
+		select {
+		case event := <-watch.Events:
+			got = append(got, event.Worker.GetWorkerPod())
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for both events; delivered so far: %v", got)
+		}
+	}
+	want := []string{"first-seq-late-commit", "second-seq-early-commit"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("event delivery order mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestTrimWorkerChanges_DeletesByAgeOnly verifies the janitor's age-based
+// retention: rows older than changeFeedRetentionAge are deleted, fresh rows
+// survive, independent of any watcher cursor.
+func TestTrimWorkerChanges_DeletesByAgeOnly(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO worker_changes (payload, created_at) VALUES
+			($1, now() - interval '1 hour'),
+			($1, now() - interval '20 minutes'),
+			($1, now())`, []byte("payload")); err != nil {
+		t.Fatalf("seeding feed rows failed: %v", err)
+	}
+
+	n, err := s.trimWorkerChanges(ctx)
+	if err != nil {
+		t.Fatalf("trimWorkerChanges failed: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("trimWorkerChanges deleted %d rows, want 2 (the two older than retention)", n)
+	}
+	var remaining int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM worker_changes`).Scan(&remaining); err != nil {
+		t.Fatalf("counting remaining rows failed: %v", err)
+	}
+	if remaining != 1 {
+		t.Errorf("%d rows remain, want 1 (the fresh row)", remaining)
+	}
+}
+
+// TestWatchWorkers_ClosesWhenTrimmedPastCursor verifies the retention
+// escape hatch: when rows a watcher has not consumed are deleted out from
+// under it (a janitor trim on a badly lagging watcher), the watcher must
+// close its channel — the signal consumers treat as resync-and-relist —
+// rather than silently skip the gap.
+func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	watch, err := s.WatchWorkers(ctx)
+	if err != nil {
+		t.Fatalf("WatchWorkers failed: %v", err)
+	}
+	defer watch.Close()
+
+	// Deliver one event normally so the cursor is established.
+	worker := &ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "pod"}
+	if err := s.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+	select {
+	case <-watch.Events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first event")
+	}
+
+	// Atomically append three events and trim all but the newest — the
+	// watcher never gets a chance to consume the first two, exactly as if
+	// the janitor trimmed rows a lagging watcher had not reached.
+	payload, err := marshalWorkerEvent(store.WorkerEventUpdated, worker)
+	if err != nil {
+		t.Fatalf("marshaling event: %v", err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin failed: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+	if _, err := tx.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1), ($1), ($1)`, payload); err != nil {
+		t.Fatalf("feed inserts failed: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH doomed AS (
+			DELETE FROM worker_changes WHERE seq < (SELECT max(seq) FROM worker_changes)
+			RETURNING seq
+		)
+		INSERT INTO worker_changes_trim (seq)
+		SELECT max(seq) FROM doomed HAVING count(*) > 0
+		ON CONFLICT (id) DO UPDATE SET seq = GREATEST(worker_changes_trim.seq, EXCLUDED.seq)`); err != nil {
+		t.Fatalf("trim failed: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// The watcher must close the channel, not deliver past the gap.
+	select {
+	case event, ok := <-watch.Events:
+		if ok {
+			t.Fatalf("received event %+v past a trimmed gap; expected the channel to close for resync", event)
+		}
+		// Expected: channel closed.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the watch channel to close after a trim past the cursor")
 	}
 }
 
