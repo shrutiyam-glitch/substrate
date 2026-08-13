@@ -150,3 +150,19 @@ tuples crossed the 0.2× threshold mid-window), bgwriter, disk variance.
 Verdict line for the report: p50 7 / p95 ≤9 ms stable across all configs;
 p99 10–69 ms is background-write alignment, 27.5 with checkpoint tuning —
 operational levers, not schema issues. FLAGS LEFT SET on the instance.
+
+### Review-hardened feed code, same protocol (2026-08-13)
+
+Change-feed review fixes ((xid,seq) gap-free cursor + xid fence, two extra
+columns w/ defaults, (xid,seq) btree + created_at BRIN indexes, store-level
+aged janitor, trim high-water table) benchmarked on bench/cloudsql commit
+c63359fe. atepg_v2 retrofitted additively (ALTER TABLE only; 1M workers
+intact). Checkpoint-free protocol (manual CHECKPOINT + 2m settle; flags
+30min/32GB): WorkerUpdate @1k, 1M workers: p50 6.91 / p90 7.71 / p95 8.00 /
+**p99 9.91** / p99.9 45.4, 1 conflict, full drain.
+
+Verdict: the hardening costs nothing measurable on the hot path (within
+run-to-run variance of the 7.08/27.5 baseline; if anything faster) and this
+is the first 1M-worker run with p99 inside the <=10ms update target. The
+extra per-update work (2 column defaults + right-edge btree insert + BRIN)
+is invisible at 1k QPS.
