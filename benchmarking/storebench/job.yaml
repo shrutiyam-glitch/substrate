@@ -80,10 +80,6 @@ spec:
         - name: metrics
           containerPort: 9090
         env:
-        # "1" replaces per-write pg_notify with the worker_changes feed table
-        # (pg_notify's global commit serialization caps worker writes ~600/s).
-        - name: ATEPG_CHANGE_FEED
-          value: "0"
         - name: STOREBENCH_POSTGRES_DSN
           valueFrom:
             secretKeyRef:

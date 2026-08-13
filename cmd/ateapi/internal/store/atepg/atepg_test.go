@@ -180,8 +180,8 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 		worker.GetWorkerNamespace(), worker.GetWorkerPool(), worker.GetWorkerPod(), int64(1), protoBytes); err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, workerChangeChannel, "rolled-back-payload"); err != nil {
-		t.Fatalf("pg_notify failed: %v", err)
+	if _, err := tx.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, []byte("rolled-back-payload")); err != nil {
+		t.Fatalf("feed insert failed: %v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("Rollback failed: %v", err)
