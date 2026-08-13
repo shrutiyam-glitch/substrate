@@ -52,28 +52,18 @@ spec:
         #   --redis-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
         # --- dataset rung (S: 10k/100/10; M: 100k/1000/100; L: 500k/5000/500) ---
         - --actors=0
-        - --workers=10000
+        - --workers=1000000
         - --atespaces=1
-        - --worker-pools=1
+        - --worker-pools=2
         # --- load profile ---
-        - --rps=5000
-        - --skip-load=false
-        - --load-only=true
-        - --seed-actor-prefix=cactor-
-        - --seed-worker-prefix=cworker-
-        - --seed-worker-sandbox-class=gvisor
-        - --seed-worker-active=true
-        - --seed-worker-labels=workload=benchmark-ateom
-        - --seed-worker-namespace=benchmark-workloads
-        - --seed-pool-prefix=benchmark-ateom
-        - --seed-template-namespace=benchmark-workloads
-        - --seed-template-name=sleep
+        - --rps=1000
+        - --skip-load=true
         - --actor-bytes=3000
         - --worker-bytes=1000
         - --snapshot-bytes=1000
         - --duration=3m
         - --warmup=1m
-        - --mix=actorupdate=100
+        - --mix=workerupdate=100
         - --key-dist=uniform
         - --json-out=/dev/termination-log
         ports:
@@ -83,7 +73,7 @@ spec:
         - name: STOREBENCH_POSTGRES_DSN
           valueFrom:
             secretKeyRef:
-              name: storebench-dsn
+              name: storebench-dsn-v2
               key: dsn
               optional: true
         volumeMounts:

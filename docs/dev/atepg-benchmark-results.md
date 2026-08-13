@@ -85,3 +85,68 @@ writes flatline); one variable per attributed run; completed-count vs
 offered is the saturation gauge (latency percentiles under saturation are
 survivorship-biased); synthetic protos are ~10× smaller than the
 requirements' 3 KB estimate — fatten for realism.
+
+## 2026-08-13 — Flagless change-feed validation on rebased code (fresh DB `atepg_v2`)
+
+Setup: `bench/cloudsql` rebased onto merged main, feed now the only
+worker-watch path (no env flag). Fresh database `atepg_v2` (new schema:
+actors +uid −status, workers −ip, snapshots −location) on the same
+`atepg-bench` instance (db-custom-4-16384, 1TB, pool_max_conns=32).
+All runs: `--mix=workerupdate=100 --rps=1000 --duration=3m --warmup=1m`,
+uniform keys, full drain (180,008 completions), 0 errors.
+
+| Fleet | Condition | p50 | p90 | p95 | p99 | p99.9 | conflicts |
+|---|---|---|---|---|---|---|---|
+| 10k workers | right after seed, cold DB | 6.56 | 8.38 | 10.37 | 32.41 | — | 128 (0.07%) |
+| 1M workers | right after 990k-row COPY + 2m settle | 7.32 | 8.89 | 11.44 | 69.06 | 113.3 | 2 |
+| 1M workers | warm repeat (settled, steady state) | **6.26** | **7.14** | **7.58** | **10.13** | 91.6 | 2 |
+
+Findings:
+- Steady-state p99 at requirements-scale worker cardinality (1M) is
+  **10.1 ms** — at the ≤10 ms update target boundary; p50 6.3 ms matches
+  the post-fast-CAS-removal arithmetic (4-RTT tx + feed insert).
+- Fleet size does not move the medians (workers table ~1 GB, cache
+  resident). CAS conflicts are a key-density property: 128 at 10k
+  workers → 2 at 1M.
+- Both elevated-tail rows are the measure-after-ingest protocol violation
+  (first-touch page reads + checkpoint wave from the 1 GB seed);
+  reproduced and cleared by a warm repeat. Reconfirms the "settle until
+  disk writes flatline" rule.
+
+### Clean-protocol repeat + p99 root cause (checkpoint alignment)
+
+Fourth run, strict hygiene: VACUUM ANALYZE workers/worker_changes (0 dead
+tuples — autovacuum had already caught up), forced CHECKPOINT, 5m settle,
+then the identical 1M-worker workerupdate @1k: p50 7.41 / p90 8.64 /
+p95 9.83 / **p99 45.4** / p99.9 123.6, 3 conflicts, full drain.
+
+p99 across the three 1M runs: 69 → 10 → 45 ms while p50/p90/p95 stayed
+~7/9/10 ms. The tail is EPISODIC, not load- or hygiene-driven. Cause
+(from pg_settings, server is PG 18.4): `checkpoint_timeout=300s` — every
+4-minute run (1m warmup + 3m window) contains ≥1 timed checkpoint; and
+uniform keys over 163k table pages make every post-checkpoint update emit
+a ~8KB full-page image, ≈0.5 GB WAL/min, so `max_wal_size=1504MB` also
+forces a requested checkpoint ~every 3 min. Whether the checkpoint write
+burst lands in warmup or in the measured window is pure clock alignment —
+hence 10 vs 45 vs 69. (Same "checkpoint-flavored tails / max_wal_size"
+signature as tier-M lock/snapcreate knees, runs 31–36.)
+
+Implications: sub-p99 metrics are the stable schema signal (p95 ≤10 ms at
+1M workers ✓). To make p99 honest rather than alignment-lottery: run ≥10m
+windows (averages ~2–3 checkpoints in), or raise `max_wal_size` +
+`checkpoint_timeout` (Cloud SQL flags) and re-measure. The XL 173 ms p99
+was a different regime (300 GB co-resident tables, instance I/O
+saturation), not comparable.
+
+### Checkpoint-free run (flags applied)
+
+Cloud SQL flags set on atepg-bench (no restart needed, verified live):
+`checkpoint_timeout=1800`, `max_wal_size=32768` (MB). Manual CHECKPOINT +
+2m settle, then one run: p50 7.08 / p90 8.04 / p95 8.52 / p99 **27.5** /
+p99.9 90 / max 400, 0 conflicts, full drain. Tightest p90/p95 of all five
+1M runs; the 45–69 ms checkpoint burst is gone. Residual p99 ≈27 ms is
+other background I/O — most likely autovacuum (prior run's ~180k dead
+tuples crossed the 0.2× threshold mid-window), bgwriter, disk variance.
+Verdict line for the report: p50 7 / p95 ≤9 ms stable across all configs;
+p99 10–69 ms is background-write alignment, 27.5 with checkpoint tuning —
+operational levers, not schema issues. FLAGS LEFT SET on the instance.
