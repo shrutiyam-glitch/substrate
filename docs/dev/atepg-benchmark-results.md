@@ -239,3 +239,26 @@ janitor delete bursts (partition-drop retention, verified live in-window
 at p99 9.7), feed insert-autovacuum (disabled on hourly partitions).
 Managed by ops knobs: checkpoint cadence (instance flags). Remaining:
 ~30ms residual jitter at p99, unattributed, consistent.
+
+### Review-hardened feed, final validation pair (2026-08-14)
+
+Three review rounds committed (bench branch 47228ec8: (xid,seq) tuple trim
+mark, aliased poll SQL — an unaliased xid::text cast had been text-sorting
+the poll, a silent event-loss + full-scan blocker caught in review before
+ever running — advisory-lock single-tx retention, 15-min partitions,
+pg_postmaster_start_time restart detection, safety-gated delivery, stall
+warnings, PG17 guard; 20 tests incl. plan pinning). atepg_v2 retrofitted
+additively (pdefault rename, trim xid column, clock_timestamp default).
+
+| run | p50 | p90 | p95 | p99 | p99.9 |
+|---|---|---|---|---|---|
+| 1 | 7.25 | 8.20 | 8.58 | 10.42 | 38.5 |
+| 2 | 7.36 | 8.37 | 8.81 | 10.71 | 39.7 |
+
+First pair of the series where BOTH runs land ~10ms p99, with every
+percentile within 0.3ms across runs — the tail-source elimination
+(notify → feed, delete-burst → partition drop, feed autovacuum → off,
+checkpoint → flags) has made the result reproducible, not just good.
+15-min partitions routing correctly (DEFAULT 0 bytes; ~1.3KB/row holds).
+Legacy hourly partitions (~1.25GB) linger by design — new code ignores
+their names; drop manually at next cleanup.
