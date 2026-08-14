@@ -195,3 +195,24 @@ run starts from a freshly vacuumed table), not the feed. Across all seven
 checkpoint/vacuum lands inside it. Partitioning removes the janitor's
 delete burst from that list of tail sources permanently (the p99-141ms
 catch-up case is now structurally impossible).
+
+### UNLOGGED feed partitions (2026-08-14)
+
+Feed partitions made UNLOGGED (commit on both branches; trim table stays
+logged; watcher closes for resync after 50 consecutive failed polls — the
+DB-restart signature, since restart truncates unlogged tables). Existing
+partitions converted via ALTER TABLE SET UNLOGGED. Pair at 1M workers @1k:
+
+| run | p50 | p90 | p95 | p99 |
+|---|---|---|---|---|
+| 1 | 7.29 | 8.06 | 8.34 | **9.73** |
+| 2 | 7.43 | 8.84 | 10.34 | 92.9 (second-run autovacuum signature) |
+
+Verdicts: (1) UNLOGGED is latency-neutral at 1k QPS (identical to logged
+baseline 7.02/9.83) — its value is WAL bandwidth at the 10k/s ceiling
+(~15 MB/s removed) and reduced checkpoint pressure, an arithmetic claim,
+not a measured-at-1k one. (2) **Partition-drop retention validated live**:
+the janitor dropped the previous 313 MB partition INSIDE run 1's
+measurement window and p99 stayed 9.73 ms — vs p99 141 ms when the old
+row-delete janitor reclaimed a comparable backlog mid-run. Retention cost
+went from measurable-worst-tail-source to unmeasurable.
