@@ -1118,11 +1118,6 @@ const (
 	// DEFAULT partition backstop. Every live partition is a merge-append
 	// input on every poll, so the lead stays small.
 	changeFeedPartitionLead = 2
-
-	// changeFeedStallWarnAfter is how long committed events may sit behind
-	// a static xmin fence before the watcher warns that a transaction
-	// somewhere on the cluster is stalling delivery (see WatchWorkers).
-	changeFeedStallWarnAfter = 30 * time.Second
 )
 
 // changeFeedMaintenance maintains worker_changes partitions on a fixed timer,
@@ -1180,19 +1175,14 @@ const pollWorkerChangesSQL = `
 	ORDER BY xid LIMIT $2`
 
 // pollSafetySQL returns the watch's safety scalars: the fell-behind check
-// (tuple-wise in the cursor's own ordering, firing iff the trim mark is
-// past BOTH the cursor and the subscribe-time baseline), whether committed
-// events are waiting behind the xmin fence, the fence itself (for stall
-// detection), and the postmaster start time (for restart detection).
+// (firing iff the trim mark is past BOTH the cursor and the
+// subscribe-time baseline) and the postmaster start time (for restart
+// detection). Both are essentially free — a one-row-table EXISTS and a
+// cached scalar — so they ride every poll's round trip unconditionally.
 const pollSafetySQL = `
 	SELECT EXISTS(
 		SELECT 1 FROM worker_changes_trim
 		WHERE xid > $1::xid8 AND xid > $2::xid8),
-	EXISTS(
-		SELECT 1 FROM worker_changes
-		WHERE xid > $1::xid8
-		  AND xid >= pg_snapshot_xmin(pg_current_snapshot())),
-	pg_snapshot_xmin(pg_current_snapshot())::text,
 	pg_postmaster_start_time()::text`
 
 // maintainWorkerChangesPartitions is one maintenance pass. Partition
@@ -1412,12 +1402,13 @@ func (p *Persistence) truncateWorkerChangesDefault(ctx context.Context, q querie
 // instance, so one long transaction — an idle BEGIN in a psql session, an
 // analytics query, a migration — stalls delivery of every event committed
 // after it for as long as it lives. Feed writers commit in milliseconds,
-// so the normal added latency is a poll interval; when fenced events wait
-// longer than changeFeedStallWarnAfter the watcher logs a warning (alert
-// on it). A stall outliving changeFeedRetentionAge escalates: retention
-// discards fenced-but-unconsumed rows, and every watcher closes and
-// relists at once. Cap stray transaction lifetimes with
-// idle_in_transaction_session_timeout well below the retention age.
+// so the normal added latency is a poll interval. Stalls are an ops
+// concern, not a watch concern: alert on long-running transactions
+// (pg_stat_activity) and cap strays with
+// idle_in_transaction_session_timeout well below changeFeedRetentionAge,
+// because a stall outliving retention escalates — retention discards
+// fenced-but-unconsumed rows and every watcher closes and relists at
+// once.
 //
 // Events are
 // delivered in xid order, which can reorder updates to the same worker
@@ -1466,18 +1457,6 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 		defer close(ch)
 		ticker := time.NewTicker(changeFeedPollInterval)
 		defer ticker.Stop()
-		// The safety scalars ride a ~1s sub-tick, not every poll: a restart
-		// or trim noticed up to a second late recovers identically, the
-		// stall warning has 30s granularity anyway, and this keeps the
-		// 10Hz hot path to exactly one statement. Stall-visibility state
-		// (an xmin that is not advancing while committed events wait
-		// behind it means some long transaction on the cluster is blocking
-		// delivery) lives entirely on that slow path.
-		var lastXmin string
-		xminSince := time.Now()
-		var lastStallWarn time.Time
-		var nextSafety time.Time
-		active := false
 		for {
 			select {
 			case <-watchCtx.Done():
@@ -1490,19 +1469,15 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 			// headroom over the watch throughput target, so any burst
 			// would open a lag the watcher could never close.
 			for {
-				// Rows are NEVER delivered past an unchecked gap or
-				// restart, so any poll that might deliver carries the
-				// safety scalars in its round trip: while actively
-				// delivering, every poll; while idle, a ~1s sub-tick. The
+				// Both statements share one round trip; the safety
 				// scalars cannot ride the batch query's row output,
 				// because an empty batch would drop them exactly when a
-				// fully-trimmed gap needs detecting.
-				withSafety := active || !time.Now().Before(nextSafety)
+				// fully-trimmed gap needs detecting. Checking them on
+				// every poll makes "rows are never delivered past an
+				// unchecked gap or restart" true by construction.
 				b := &pgx.Batch{}
 				b.Queue(pollWorkerChangesSQL, cursorXid, changeFeedBatch)
-				if withSafety {
-					b.Queue(pollSafetySQL, cursorXid, baselineXid)
-				}
+				b.Queue(pollSafetySQL, cursorXid, baselineXid)
 				br := p.pool.SendBatch(watchCtx, b)
 
 				type feedRow struct {
@@ -1522,10 +1497,10 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 					}
 					rows.Close()
 				}
-				var fellBehind, heldBack bool
-				var xminNow, pmStart string
-				if err == nil && withSafety {
-					err = br.QueryRow().Scan(&fellBehind, &heldBack, &xminNow, &pmStart)
+				var fellBehind bool
+				var pmStart string
+				if err == nil {
+					err = br.QueryRow().Scan(&fellBehind, &pmStart)
 				}
 				if closeErr := br.Close(); err == nil {
 					err = closeErr
@@ -1540,46 +1515,23 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 					slog.WarnContext(watchCtx, "worker change feed poll failed", slog.Any("err", err))
 					break
 				}
-				if len(batch) > 0 && !withSafety {
-					// First delivery after an idle streak: fetch the
-					// safety scalars before delivering anything.
-					if err := p.pool.QueryRow(watchCtx, pollSafetySQL, cursorXid, baselineXid).Scan(&fellBehind, &heldBack, &xminNow, &pmStart); err != nil {
-						if watchCtx.Err() != nil {
-							return
-						}
-						slog.WarnContext(watchCtx, "worker change feed safety check failed", slog.Any("err", err))
-						break
-					}
-					withSafety = true
+				// A restarted postmaster truncated the UNLOGGED feed:
+				// committed-but-undelivered events may be gone, so close
+				// before the cursor can skip past them; consumers resync
+				// with a full relist.
+				if pmStart != baselineStart {
+					slog.WarnContext(watchCtx, "database restarted under the change feed; closing watch for resync",
+						slog.String("was", baselineStart), slog.String("now", pmStart))
+					return
 				}
-				active = len(batch) > 0
-				if withSafety {
-					nextSafety = time.Now().Add(time.Second)
-					// A restarted postmaster truncated the UNLOGGED feed:
-					// committed-but-undelivered events may be gone, so close
-					// before the cursor can skip past them; consumers resync
-					// with a full relist.
-					if pmStart != baselineStart {
-						slog.WarnContext(watchCtx, "database restarted under the change feed; closing watch for resync",
-							slog.String("was", baselineStart), slog.String("now", pmStart))
-						return
-					}
-					if xminNow != lastXmin {
-						lastXmin, xminSince = xminNow, time.Now()
-					} else if heldBack && time.Since(xminSince) > changeFeedStallWarnAfter && time.Since(lastStallWarn) > changeFeedStallWarnAfter {
-						lastStallWarn = time.Now()
-						slog.WarnContext(watchCtx, "worker change feed delivery stalled behind an old transaction; find and end it (alert-worthy)",
-							slog.String("xmin", xminNow), slog.Duration("stalled_for", time.Since(xminSince)))
-					}
-					// Retention safety: if retention's recorded trim
-					// high-water mark is ahead of everything this watcher
-					// has seen, a row it never consumed was deleted. Close
-					// before delivering anything past the gap.
-					if fellBehind {
-						slog.WarnContext(watchCtx, "worker watch fell behind change feed retention; closing for resync",
-							slog.String("cursor_xid", cursorXid))
-						return
-					}
+				// Retention safety: if retention's recorded trim high-water
+				// mark is ahead of everything this watcher has seen, a row
+				// it never consumed was discarded. Close before delivering
+				// anything past the gap.
+				if fellBehind {
+					slog.WarnContext(watchCtx, "worker watch fell behind change feed retention; closing for resync",
+						slog.String("cursor_xid", cursorXid))
+					return
 				}
 
 				for _, r := range batch {
