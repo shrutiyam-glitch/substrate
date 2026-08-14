@@ -1102,8 +1102,8 @@ const (
 // letting the table grow without bound (the write path always appends).
 // Retention is a partition DROP — a metadata operation — so reclaiming even
 // a large backlog produces no delete/WAL/vacuum load competing with
-// foreground traffic (bulk row DELETEs measurably degrade update p99; see
-// the benchmarking ledger).
+// foreground traffic (an earlier row-DELETE janitor draining a backlog
+// mid-traffic degraded worker-update p99 by an order of magnitude).
 func (p *Persistence) changeFeedJanitor(ctx context.Context) {
 	ticker := time.NewTicker(changeFeedJanitorInterval)
 	defer ticker.Stop()
@@ -1167,10 +1167,10 @@ func (p *Persistence) createWorkerChangesPartitions(ctx context.Context, hours .
 		// insert-only and dropped whole shortly after their hour passes,
 		// so none of autovacuum's jobs (dead-tuple reclamation,
 		// wraparound freezing, visibility-map upkeep) applies — while its
-		// insert-triggered runs re-read the partition mid-traffic
-		// (measured as an in-window p99 spike; see the benchmarking
-		// ledger). The DEFAULT partition keeps autovacuum: it is the one
-		// place feed rows are deleted in place.
+		// insert-triggered runs re-read the active partition mid-traffic
+		// (measured as a ~10x worker-update p99 spike). The DEFAULT
+		// partition keeps autovacuum: it is the one place feed rows are
+		// deleted in place.
 		stmt := fmt.Sprintf(`CREATE UNLOGGED TABLE IF NOT EXISTS %s PARTITION OF worker_changes FOR VALUES FROM ('%s') TO ('%s') WITH (autovacuum_enabled = off)`,
 			workerChangesPartitionName(start), start.Format(time.RFC3339), start.Add(time.Hour).Format(time.RFC3339))
 		if _, err := tx.Exec(ctx, stmt); err != nil {

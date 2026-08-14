@@ -150,10 +150,11 @@ func TestCreateActor_MissingAtespace_FailedPrecondition(t *testing.T) {
 	}
 }
 
-// TestWorkerNotification_OnlyAfterCommit proves the doc's atomicity claim: a
-// worker write's pg_notify shares the write's transaction, so a rolled-back
-// write never notifies, while a committed write always does.
-func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
+// TestWorkerEvent_OnlyAfterCommit proves the doc's atomicity claim: a
+// worker write's change-feed insert shares the write's transaction, so a
+// rolled-back write never produces an event, while a committed write always
+// does.
+func TestWorkerEvent_OnlyAfterCommit(t *testing.T) {
 	s := setupPostgresStore(t).(*Persistence)
 	ctx := context.Background()
 
@@ -169,9 +170,9 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 		t.Fatalf("marshaling worker: %v", err)
 	}
 
-	// Write the row and roll back instead of committing: no notification
-	// should ever arrive, proving pg_notify's effect is undone with the rest
-	// of the transaction.
+	// Write the row and roll back instead of committing: no event should
+	// ever arrive, proving the feed insert is undone with the rest of the
+	// transaction.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin failed: %v", err)
@@ -191,12 +192,12 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 
 	select {
 	case event := <-watch.Events:
-		t.Fatalf("received event %+v from a rolled-back transaction; NOTIFY should not survive rollback", event)
+		t.Fatalf("received event %+v from a rolled-back transaction; the feed insert must be undone with the rest of the transaction", event)
 	case <-time.After(500 * time.Millisecond):
 		// Expected: nothing arrives.
 	}
 
-	// The equivalent committed write must notify.
+	// The equivalent committed write must produce an event.
 	if err := s.CreateWorker(ctx, worker); err != nil {
 		t.Fatalf("CreateWorker failed: %v", err)
 	}
