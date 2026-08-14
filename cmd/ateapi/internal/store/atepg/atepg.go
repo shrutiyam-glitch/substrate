@@ -1119,9 +1119,6 @@ const (
 	// input on every poll, so the lead stays small.
 	changeFeedPartitionLead = 2
 
-	// changeFeedDefaultTrimBatch bounds the row-wise fallback trim of the DEFAULT partition.
-	changeFeedDefaultTrimBatch = 10_000
-
 	// changeFeedStallWarnAfter is how long committed events may sit behind
 	// a static xmin fence before the watcher warns that a transaction
 	// somewhere on the cluster is stalling delivery (see WatchWorkers).
@@ -1224,28 +1221,30 @@ func (p *Persistence) maintainWorkerChangesPartitions(ctx context.Context) error
 		return nil // another replica is maintaining; next tick retries
 	}
 	// A non-empty DEFAULT partition means partition creation stalled long
-	// enough for writes to detour — and it is self-amplifying: creating a
-	// partition must scan DEFAULT (under ACCESS EXCLUSIVE) to prove no rows
-	// belong to the new range, and FAILS if any do, so fresh strays keep
-	// creation failing until the next range boundary while each retry
-	// rescans a growing DEFAULT. This warning firing at all is
-	// alert-worthy. The row trim clears strays once they age past
-	// retention, and runs only when there is something to clear — in
-	// steady state the pass issues no DML at all.
+	// enough for writes to detour — a pathology by definition, and
+	// self-amplifying if left: creating a partition must scan DEFAULT
+	// (under ACCESS EXCLUSIVE) to prove no rows belong to the new range,
+	// and FAILS if any do. So the response is wholesale: record the mark
+	// and TRUNCATE — a bounded row trim could never outrun the fill rate
+	// that put rows here, while an emptied DEFAULT lets the very next
+	// CREATE's validation pass, turning the stall self-healing. Watchers
+	// that lose events this way trip the fellBehind resync. This warning
+	// firing at all is alert-worthy; in steady state the pass issues no
+	// DML at all.
 	var strays bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM worker_changes_default)`).Scan(&strays); err != nil {
 		return fmt.Errorf("checking feed default partition: %w", err)
 	}
 	if strays {
 		slog.WarnContext(ctx, "change feed DEFAULT partition is non-empty; partition creation has stalled and writes are detouring")
-		if err := p.trimWorkerChangesDefault(ctx, tx); err != nil {
+		if err := p.truncateWorkerChangesDefault(ctx, tx); err != nil {
 			return err
 		}
 	}
 	// Drops run LAST, with commit immediately after: dropping a partition
 	// takes ACCESS EXCLUSIVE on the parent — blocking every worker write's
-	// feed append — and holds it until this transaction commits. The trim
-	// above needs only ROW EXCLUSIVE on the DEFAULT partition, so ordering
+	// feed append — and holds it until this transaction commits. The
+	// truncate above locks only the DEFAULT partition itself, so ordering
 	// it first keeps the writer-blocking window to the drops alone.
 	if err := p.dropExpiredWorkerChangesPartitions(ctx, tx, now); err != nil {
 		return err
@@ -1290,13 +1289,11 @@ func (p *Persistence) createWorkerChangesPartitions(ctx context.Context, instant
 		start := at.UTC().Truncate(changeFeedPartitionInterval)
 		// UNLOGGED: see the worker_changes schema comment for the
 		// durability trade. autovacuum off: feed partitions are
-		// insert-only and dropped whole shortly after their range passes,
-		// so none of autovacuum's jobs (dead-tuple reclamation,
-		// wraparound freezing, visibility-map upkeep) applies — while its
-		// insert-triggered runs re-read the active partition mid-traffic
-		// (measured as a ~10x worker-update p99 spike). The DEFAULT
-		// partition keeps autovacuum: it is the one place feed rows are
-		// deleted in place.
+		// insert-only and discarded whole (drop or truncate), so none of
+		// autovacuum's jobs (dead-tuple reclamation, wraparound freezing,
+		// visibility-map upkeep) applies — while its insert-triggered
+		// runs re-read the active partition mid-traffic (measured as a
+		// ~10x worker-update p99 spike).
 		stmt := fmt.Sprintf(`CREATE UNLOGGED TABLE IF NOT EXISTS %s PARTITION OF worker_changes FOR VALUES FROM ('%s') TO ('%s') WITH (autovacuum_enabled = off)`,
 			workerChangesPartitionName(start), start.Format(time.RFC3339), start.Add(changeFeedPartitionInterval).Format(time.RFC3339))
 		if _, err := tx.Exec(ctx, stmt); err != nil {
@@ -1379,29 +1376,24 @@ func (p *Persistence) dropWorkerChangesPartition(ctx context.Context, q querier,
 	return nil
 }
 
-// trimWorkerChangesDefault deletes one bounded batch of aged rows from the
-// DEFAULT partition — the row-wise fallback for writes that landed there
-// because no hourly partition covered them (partition creation stalled).
-// Empty in normal operation, and deliberately ONE batch per pass: draining
-// a backlog in a loop would recreate the bulk-delete I/O burst that
-// partition-drop retention exists to avoid, and the next pass is a minute
-// away. The trim mark — the deleted set's greatest xid — is recorded in
-// the same statement, so loss detection stays exact.
-func (p *Persistence) trimWorkerChangesDefault(ctx context.Context, q querier) error {
+// truncateWorkerChangesDefault discards the DEFAULT partition wholesale:
+// rows land there only when partition creation has stalled, chasing them
+// row by row can never outrun the fill rate that put them there, and an
+// empty DEFAULT is what lets partition creation succeed again. The mark is
+// recorded in the same transaction as the TRUNCATE, so watchers that lose
+// unconsumed events detect it exactly (fellBehind) and resync. TRUNCATE's
+// ACCESS EXCLUSIVE is on the DEFAULT partition alone — worker writes
+// routing to real partitions keep flowing.
+func (p *Persistence) truncateWorkerChangesDefault(ctx context.Context, q querier) error {
 	if _, err := q.Exec(ctx, `
-		WITH doomed AS (
-			DELETE FROM worker_changes_default WHERE xid IN (
-				SELECT xid FROM worker_changes_default
-				WHERE created_at < now() - make_interval(secs => $1)
-				ORDER BY xid LIMIT $2)
-			RETURNING xid
-		)
 		INSERT INTO worker_changes_trim (xid)
-		SELECT xid FROM doomed ORDER BY xid DESC LIMIT 1
+		SELECT xid FROM worker_changes_default ORDER BY xid DESC LIMIT 1
 		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid
-		WHERE EXCLUDED.xid > worker_changes_trim.xid`,
-		changeFeedRetentionAge.Seconds(), changeFeedDefaultTrimBatch); err != nil {
-		return fmt.Errorf("trimming feed default partition: %w", err)
+		WHERE EXCLUDED.xid > worker_changes_trim.xid`); err != nil {
+		return fmt.Errorf("recording trim mark for feed default partition: %w", err)
+	}
+	if _, err := q.Exec(ctx, `TRUNCATE worker_changes_default`); err != nil {
+		return fmt.Errorf("truncating feed default partition: %w", err)
 	}
 	return nil
 }

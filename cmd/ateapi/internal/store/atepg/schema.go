@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS workers (
 -- competes with foreground traffic. The maintenance loop
 -- (changeFeedMaintenance) creates upcoming partitions and drops expired
 -- ones; the DEFAULT partition only receives writes if partition creation
--- ever stalls, and is trimmed row-wise as a fallback.
+-- ever stalls, and is truncated wholesale once maintenance notices
+-- (watchers that lose events to that resync via the trim mark).
 --
 -- Partitions are UNLOGGED: the feed is ephemeral by design (cursors are
 -- not durable, subscriptions start "from now", and every consumer rebuilds
@@ -109,11 +110,11 @@ CREATE TABLE IF NOT EXISTS worker_changes (
 
 CREATE INDEX IF NOT EXISTS worker_changes_xid ON worker_changes (xid);
 
-CREATE UNLOGGED TABLE IF NOT EXISTS worker_changes_default PARTITION OF worker_changes DEFAULT;
+CREATE UNLOGGED TABLE IF NOT EXISTS worker_changes_default PARTITION OF worker_changes DEFAULT WITH (autovacuum_enabled = off);
 
 -- Single-row high-water mark of retention: the greatest xid ever discarded
--- from worker_changes (dropped with an expired partition, or row-trimmed
--- from the DEFAULT partition). Watchers compare it against their cursor to
+-- from worker_changes (dropped with an expired partition, or truncated
+-- with the DEFAULT partition). Watchers compare it against their cursor to
 -- detect exactly that unconsumed rows were discarded out from under them.
 CREATE TABLE IF NOT EXISTS worker_changes_trim (
     id   boolean PRIMARY KEY DEFAULT true CHECK (id),

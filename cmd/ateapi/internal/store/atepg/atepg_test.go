@@ -587,11 +587,10 @@ func TestChangeFeedMaintenance_ConcurrentPassesAreHarmless(t *testing.T) {
 
 // TestWorkerChangesPartitionsAreUnlogged pins the maintenance profile the
 // schema documents: every feed partition must be UNLOGGED (relpersistence
-// 'u'); hourly partitions must have autovacuum disabled (insert-only,
-// dropped whole — an in-window insert-autovacuum is a measured p99 spike)
-// while the DEFAULT partition keeps it (rows are deleted in place there);
-// and worker_changes_trim — the loss-detection high-water mark — must
-// remain logged so it survives a crash.
+// 'u') with autovacuum disabled (all are insert-only and discarded whole,
+// by drop or truncate — an in-window insert-autovacuum is a measured p99
+// spike); and worker_changes_trim — the loss-detection high-water mark —
+// must remain logged so it survives a crash.
 func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
@@ -614,13 +613,8 @@ func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
 		if persistence != "u" {
 			t.Errorf("partition %s has relpersistence %q, want 'u' (unlogged)", name, persistence)
 		}
-		autovacuumOff := strings.Contains(options, "autovacuum_enabled=off")
-		if name == "worker_changes_default" {
-			if autovacuumOff {
-				t.Errorf("DEFAULT partition has autovacuum disabled; it must keep it (rows are deleted in place there)")
-			}
-		} else if !autovacuumOff {
-			t.Errorf("hourly partition %s does not disable autovacuum (reloptions %q)", name, options)
+		if !strings.Contains(options, "autovacuum_enabled=off") {
+			t.Errorf("partition %s does not disable autovacuum (reloptions %q)", name, options)
 		}
 		checked++
 	}
