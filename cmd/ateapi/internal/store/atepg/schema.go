@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS workers (
 -- Transactional change feed backing WatchWorkers. Events are appended in
 -- the same transaction as the worker write and delivered by polling past
 -- an xid cursor;
--- payload is a JSON envelope: {"t": <event type>, "w": <protojson Worker>}.
+-- payload is one event-type byte followed by the binary Worker proto.
 --
 -- xid is the whole ordering: writeAndAppendChange appends exactly ONE row
 -- per transaction (the only insert site), so every feed row has a distinct

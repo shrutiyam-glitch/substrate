@@ -23,7 +23,6 @@ package atepg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,7 +36,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -392,7 +390,6 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 	if commandTag.RowsAffected() != 1 {
 		return nil, fmt.Errorf("updating actor %s/%s affected %d rows, want 1", atespace, name, commandTag.RowsAffected())
 	}
-
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing actor update: %w", err)
@@ -854,35 +851,29 @@ func (p *Persistence) DeleteActorSnapshotTag(ctx context.Context, atespace, name
 
 // --- Workers ---
 
-
-
-type workerEventEnvelope struct {
-	Type   int    `json:"t"`
-	Worker string `json:"w"` // protojson-encoded Worker
-}
-
+// Feed payload format: one event-type byte followed by the binary Worker
+// proto. (The previous protojson-inside-JSON envelope was a LISTEN/NOTIFY
+// artifact — NOTIFY payloads had to be text; a bytea column does not.)
+// The tag byte is read by other replicas during rolling deploys, so
+// store.WorkerEventType values must stay append-only stable and fit a
+// byte.
 func marshalWorkerEvent(eventType store.WorkerEventType, worker *ateapipb.Worker) ([]byte, error) {
-	workerJSON, err := protojson.Marshal(worker)
+	b, err := proto.Marshal(worker)
 	if err != nil {
-		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
+		return nil, fmt.Errorf("in proto.Marshal: %w", err)
 	}
-	msg, err := json.Marshal(workerEventEnvelope{Type: int(eventType), Worker: string(workerJSON)})
-	if err != nil {
-		return nil, fmt.Errorf("in json.Marshal: %w", err)
-	}
-	return msg, nil
+	return append([]byte{byte(eventType)}, b...), nil
 }
 
 func unmarshalWorkerEvent(payload []byte) (store.WorkerEvent, error) {
-	var env workerEventEnvelope
-	if err := json.Unmarshal(payload, &env); err != nil {
-		return store.WorkerEvent{}, fmt.Errorf("in json.Unmarshal: %w", err)
+	if len(payload) == 0 {
+		return store.WorkerEvent{}, fmt.Errorf("empty worker event payload")
 	}
 	worker := &ateapipb.Worker{}
-	if err := protojson.Unmarshal([]byte(env.Worker), worker); err != nil {
-		return store.WorkerEvent{}, fmt.Errorf("in protojson.Unmarshal: %w", err)
+	if err := proto.Unmarshal(payload[1:], worker); err != nil {
+		return store.WorkerEvent{}, fmt.Errorf("in proto.Unmarshal: %w", err)
 	}
-	return store.WorkerEvent{Type: store.WorkerEventType(env.Type), Worker: worker}, nil
+	return store.WorkerEvent{Type: store.WorkerEventType(payload[0]), Worker: worker}, nil
 }
 
 // writeAndAppendChange runs fn inside a transaction, then--only if fn
