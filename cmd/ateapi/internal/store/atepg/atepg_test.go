@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -345,16 +346,19 @@ func TestWorkerChangesPartitionRetention(t *testing.T) {
 	}
 }
 
-// TestWorkerChangesPartitionsAreUnlogged pins the durability trade the
+// TestWorkerChangesPartitionsAreUnlogged pins the maintenance profile the
 // schema documents: every feed partition must be UNLOGGED (relpersistence
-// 'u'), while worker_changes_trim — the loss-detection high-water mark —
-// must remain logged so it survives a crash.
+// 'u'); hourly partitions must have autovacuum disabled (insert-only,
+// dropped whole — an in-window insert-autovacuum is a measured p99 spike)
+// while the DEFAULT partition keeps it (rows are deleted in place there);
+// and worker_changes_trim — the loss-detection high-water mark — must
+// remain logged so it survives a crash.
 func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT c.relname, c.relpersistence FROM pg_inherits i
+		SELECT c.relname, c.relpersistence, COALESCE(array_to_string(c.reloptions, ','), '') FROM pg_inherits i
 		JOIN pg_class c ON c.oid = i.inhrelid
 		JOIN pg_class parent ON parent.oid = i.inhparent
 		WHERE parent.relname = 'worker_changes'`)
@@ -364,12 +368,20 @@ func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
 	defer rows.Close()
 	checked := 0
 	for rows.Next() {
-		var name, persistence string
-		if err := rows.Scan(&name, &persistence); err != nil {
+		var name, persistence, options string
+		if err := rows.Scan(&name, &persistence, &options); err != nil {
 			t.Fatalf("scanning partition row: %v", err)
 		}
 		if persistence != "u" {
 			t.Errorf("partition %s has relpersistence %q, want 'u' (unlogged)", name, persistence)
+		}
+		autovacuumOff := strings.Contains(options, "autovacuum_enabled=off")
+		if name == "worker_changes_pdefault" {
+			if autovacuumOff {
+				t.Errorf("DEFAULT partition has autovacuum disabled; it must keep it (rows are deleted in place there)")
+			}
+		} else if !autovacuumOff {
+			t.Errorf("hourly partition %s does not disable autovacuum (reloptions %q)", name, options)
 		}
 		checked++
 	}
