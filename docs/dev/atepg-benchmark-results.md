@@ -216,3 +216,26 @@ the janitor dropped the previous 313 MB partition INSIDE run 1's
 measurement window and p99 stayed 9.73 ms — vs p99 141 ms when the old
 row-delete janitor reclaimed a comparable backlog mid-run. Retention cost
 went from measurable-worst-tail-source to unmeasurable.
+
+### Partition autovacuum disabled (close-out pair, 2026-08-14)
+
+Hourly partitions now created WITH (autovacuum_enabled=off) (commit
+c9a6e28f; DEFAULT partition keeps autovacuum — it takes in-place deletes).
+Pair at 1M workers @1k, no manual vacuum between runs:
+run 1: 7.12/8.18/8.96/35.5; run 2: 7.14/8.21/9.27/29.9.
+
+The 90ms-class insert-autovacuum spike is eliminated and runs are now
+CONSISTENT (~30-35ms p99 band) instead of bimodal (10 vs 42-93).
+Prediction correction: workers-table autovacuum did NOT fire in either
+window (last_autovacuum unchanged since the day before) — the residual
+~30ms tail (<1% of requests) is unattributed I/O-class variance (WAL
+flush / bgwriter / Cloud SQL disk jitter); attribution would need
+pg_stat_io or wait-event sampling in-run.
+
+SERIES CLOSE-OUT (11 runs at 1M workers @1k QPS): p50 6.9-7.4ms and
+p95 8.0-10.7ms in every configuration tested. Tail sources found and
+removed by design: pg_notify commit serialization (change feed),
+janitor delete bursts (partition-drop retention, verified live in-window
+at p99 9.7), feed insert-autovacuum (disabled on hourly partitions).
+Managed by ops knobs: checkpoint cadence (instance flags). Remaining:
+~30ms residual jitter at p99, unattributed, consistent.
