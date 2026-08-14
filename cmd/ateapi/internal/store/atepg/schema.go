@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS workers (
 -- include the partition key, and uniqueness already holds by construction
 -- (one identity sequence). Requires PostgreSQL 17+ (identity column on a
 -- partitioned table).
+--
+-- Partitions are UNLOGGED: the feed is ephemeral by design (cursors are
+-- not durable, subscriptions start "from now", and every consumer rebuilds
+-- from the workers table on resync), so paying WAL on every event — inside
+-- every worker-write transaction — buys nothing. On crash or failover
+-- PostgreSQL truncates unlogged tables; watchers treat the resulting
+-- connection loss as a resync signal (see WatchWorkers), so the delivery
+-- guarantee is: iff committed, except across a database crash, which
+-- forces a full resync. worker_changes_trim stays logged — the trim mark
+-- must survive a crash.
 CREATE TABLE IF NOT EXISTS worker_changes (
     seq         bigint GENERATED ALWAYS AS IDENTITY,
     xid         xid8 NOT NULL DEFAULT pg_current_xact_id(),
@@ -96,7 +106,7 @@ CREATE TABLE IF NOT EXISTS worker_changes (
 
 CREATE INDEX IF NOT EXISTS worker_changes_xid_seq ON worker_changes (xid, seq);
 
-CREATE TABLE IF NOT EXISTS worker_changes_pdefault PARTITION OF worker_changes DEFAULT;
+CREATE UNLOGGED TABLE IF NOT EXISTS worker_changes_pdefault PARTITION OF worker_changes DEFAULT;
 
 -- Single-row high-water mark of the janitor's trim: the greatest seq ever
 -- deleted from worker_changes. Watchers compare it against their cursor to

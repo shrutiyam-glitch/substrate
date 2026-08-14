@@ -1087,6 +1087,11 @@ const (
 	changeFeedRetentionAge    = 15 * time.Minute
 	changeFeedJanitorInterval = time.Minute
 	changeFeedJanitorBatch    = 10_000
+	// changeFeedMaxPollFailures is how many consecutive failed polls
+	// (~5s at the poll interval) a watch rides out before treating the
+	// outage as a possible database restart — which truncates the
+	// UNLOGGED feed — and closing for resync.
+	changeFeedMaxPollFailures = 50
 )
 
 // changeFeedJanitor maintains worker_changes partitions on a fixed timer,
@@ -1157,7 +1162,9 @@ func (p *Persistence) createWorkerChangesPartitions(ctx context.Context, hours .
 	}
 	for _, h := range hours {
 		start := h.UTC().Truncate(time.Hour)
-		stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s PARTITION OF worker_changes FOR VALUES FROM ('%s') TO ('%s')`,
+		// UNLOGGED: see the worker_changes schema comment for the
+		// durability trade.
+		stmt := fmt.Sprintf(`CREATE UNLOGGED TABLE IF NOT EXISTS %s PARTITION OF worker_changes FOR VALUES FROM ('%s') TO ('%s')`,
 			workerChangesPartitionName(start), start.Format(time.RFC3339), start.Add(time.Hour).Format(time.RFC3339))
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("creating feed partition for %s: %w", start, err)
@@ -1309,6 +1316,12 @@ func (p *Persistence) trimWorkerChangesDefault(ctx context.Context) (int64, erro
 // (changeFeedRetentionAge) may have had unconsumed rows trimmed; rather
 // than skip them silently, it closes the event channel, which consumers
 // already treat as a resync-and-relist signal (see workercache.watchEvents).
+// Likewise, sustained poll failure (changeFeedMaxPollFailures) closes the
+// channel: it is the signature of a database restart or failover, which
+// truncates the UNLOGGED feed partitions — events committed but not yet
+// delivered are gone, so continuing on the old cursor would skip them
+// silently. Both paths converge on the same recovery: rebuild from the
+// workers table.
 func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, error) {
 	watchCtx, cancel := context.WithCancel(ctx)
 
@@ -1338,6 +1351,13 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 		defer close(ch)
 		ticker := time.NewTicker(changeFeedPollInterval)
 		defer ticker.Stop()
+		// Sustained poll failure is the signature of a database restart or
+		// failover — which truncates the UNLOGGED feed partitions, silently
+		// discarding committed-but-undelivered events. A single failure is
+		// a transient blip worth riding out with the cursor intact; a run
+		// of them means the feed cannot be trusted across the gap, so the
+		// watch closes and consumers rebuild from the workers table.
+		pollFailures := 0
 		for {
 			select {
 			case <-watchCtx.Done():
@@ -1360,11 +1380,16 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 					if watchCtx.Err() != nil {
 						return
 					}
+					if pollFailures++; pollFailures >= changeFeedMaxPollFailures {
+						slog.WarnContext(watchCtx, "worker change feed unreachable; closing watch for resync", slog.Any("err", err))
+						return
+					}
 					// Transient poll failure: keep the cursor, try again on
 					// the next tick.
 					slog.WarnContext(watchCtx, "worker change feed poll failed", slog.Any("err", err))
 					break
 				}
+				pollFailures = 0
 				type feedRow struct {
 					seq     int64
 					xid     uint64
@@ -1398,6 +1423,10 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 				var trimmed int64
 				if err := p.pool.QueryRow(watchCtx, `SELECT COALESCE((SELECT seq FROM worker_changes_trim), 0)`).Scan(&trimmed); err != nil {
 					if watchCtx.Err() != nil {
+						return
+					}
+					if pollFailures++; pollFailures >= changeFeedMaxPollFailures {
+						slog.WarnContext(watchCtx, "worker change feed unreachable; closing watch for resync", slog.Any("err", err))
 						return
 					}
 					slog.WarnContext(watchCtx, "worker change feed trim check failed", slog.Any("err", err))

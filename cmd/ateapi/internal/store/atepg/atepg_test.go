@@ -345,6 +345,94 @@ func TestWorkerChangesPartitionRetention(t *testing.T) {
 	}
 }
 
+// TestWorkerChangesPartitionsAreUnlogged pins the durability trade the
+// schema documents: every feed partition must be UNLOGGED (relpersistence
+// 'u'), while worker_changes_trim — the loss-detection high-water mark —
+// must remain logged so it survives a crash.
+func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT c.relname, c.relpersistence FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_class parent ON parent.oid = i.inhparent
+		WHERE parent.relname = 'worker_changes'`)
+	if err != nil {
+		t.Fatalf("listing feed partitions: %v", err)
+	}
+	defer rows.Close()
+	checked := 0
+	for rows.Next() {
+		var name, persistence string
+		if err := rows.Scan(&name, &persistence); err != nil {
+			t.Fatalf("scanning partition row: %v", err)
+		}
+		if persistence != "u" {
+			t.Errorf("partition %s has relpersistence %q, want 'u' (unlogged)", name, persistence)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no feed partitions found to check")
+	}
+	var trimPersistence string
+	if err := s.pool.QueryRow(ctx, `SELECT relpersistence FROM pg_class WHERE relname = 'worker_changes_trim'`).Scan(&trimPersistence); err != nil {
+		t.Fatalf("checking worker_changes_trim persistence: %v", err)
+	}
+	if trimPersistence != "p" {
+		t.Errorf("worker_changes_trim has relpersistence %q, want 'p' (logged) — the trim mark must survive a crash", trimPersistence)
+	}
+}
+
+// TestWatchWorkers_ClosesOnPersistentPollFailure verifies the crash escape
+// hatch: a database restart truncates the UNLOGGED feed, so a watch that
+// cannot reach the feed for changeFeedMaxPollFailures consecutive polls
+// must close its channel (consumers resync) instead of riding its stale
+// cursor over silently discarded events. Simulated by closing the
+// watcher's pool out from under it.
+func TestWatchWorkers_ClosesOnPersistentPollFailure(t *testing.T) {
+	requirePool(t) // ensure the shared container exists
+	ctx := context.Background()
+	dsn, err := containerPG.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("container DSN: %v", err)
+	}
+	// A private pool so closing it cannot disturb other tests.
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("opening private pool: %v", err)
+	}
+	p, err := NewPersistence(ctx, pool)
+	if err != nil {
+		pool.Close()
+		t.Fatalf("NewPersistence failed: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	watch, err := p.WatchWorkers(ctx)
+	if err != nil {
+		pool.Close()
+		t.Fatalf("WatchWorkers failed: %v", err)
+	}
+	defer watch.Close()
+
+	pool.Close() // every poll fails from here on
+
+	deadline := time.After(changeFeedMaxPollFailures*changeFeedPollInterval + 10*time.Second)
+	for {
+		select {
+		case event, ok := <-watch.Events:
+			if !ok {
+				return // expected: channel closed for resync
+			}
+			t.Fatalf("unexpected event %+v from a watch whose pool is closed", event)
+		case <-deadline:
+			t.Fatal("watch channel did not close after sustained poll failure")
+		}
+	}
+}
+
 // TestWatchWorkers_ClosesWhenTrimmedPastCursor verifies the retention
 // escape hatch: when rows a watcher has not consumed are deleted out from
 // under it (a janitor trim on a badly lagging watcher), the watcher must
