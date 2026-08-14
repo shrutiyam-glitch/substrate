@@ -1145,12 +1145,19 @@ func (p *Persistence) changeFeedMaintenance(ctx context.Context) {
 	}
 }
 
-// changeFeedMaintenanceLockKey elects one maintainer per database via a
+// changeFeedMaintenanceLockKey elects one replica per database to run the
+// RETENTION transaction (partition drops + DEFAULT trim), via a
 // transaction-scoped advisory lock on hashtext(current_database() || key):
 // the current_database() prefix gives per-database scope (bare advisory
 // locks are per instance), the transaction scope releases it automatically
 // however the pass ends, and holding it for the whole retention
 // transaction makes concurrent drops impossible rather than tolerated.
+// Partition CREATION is deliberately outside the election: a maintainer
+// wedged mid-transaction keeps this lock until its transaction dies (which
+// idle-in-transaction can stretch to hours), and creation — the one step
+// the write path depends on — must not wait for that. Retention delayed by
+// a wedged holder just retries; creation delayed past the lead detours
+// writes into DEFAULT.
 const changeFeedMaintenanceLockKey = "atepg-change-feed-maintenance"
 
 // pollWorkerChangesSQL is the watch's batch query. The xid::text cast MUST
@@ -1208,9 +1215,6 @@ func (p *Persistence) maintainWorkerChangesPartitions(ctx context.Context) error
 	if !elected {
 		return nil // another replica is maintaining; next tick retries
 	}
-	if err := p.dropExpiredWorkerChangesPartitions(ctx, tx, now); err != nil {
-		return err
-	}
 	// A non-empty DEFAULT partition means partition creation stalled long
 	// enough for writes to detour — and it is self-amplifying: creating a
 	// partition must scan DEFAULT (under ACCESS EXCLUSIVE) to prove no rows
@@ -1229,6 +1233,14 @@ func (p *Persistence) maintainWorkerChangesPartitions(ctx context.Context) error
 		if err := p.trimWorkerChangesDefault(ctx, tx); err != nil {
 			return err
 		}
+	}
+	// Drops run LAST, with commit immediately after: dropping a partition
+	// takes ACCESS EXCLUSIVE on the parent — blocking every worker write's
+	// feed append — and holds it until this transaction commits. The trim
+	// above needs only ROW EXCLUSIVE on the DEFAULT partition, so ordering
+	// it first keeps the writer-blocking window to the drops alone.
+	if err := p.dropExpiredWorkerChangesPartitions(ctx, tx, now); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing feed retention transaction: %w", err)

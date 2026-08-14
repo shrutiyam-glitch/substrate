@@ -567,6 +567,17 @@ func TestPollQueryPlanStaysOnIndex(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
+	// Seed enough rows (and stats) for the planner to have a real choice:
+	// on empty partitions it costs bitmap scans plus an explicit Sort as
+	// cheapest regardless of the index, which would make the Merge Append
+	// assertion below vacuously unreachable.
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_changes (payload) SELECT 'x'::bytea FROM generate_series(1, 3000)`); err != nil {
+		t.Fatalf("seeding feed rows failed: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `ANALYZE worker_changes`); err != nil {
+		t.Fatalf("ANALYZE failed: %v", err)
+	}
+
 	rows, err := s.pool.Query(ctx, "EXPLAIN "+pollWorkerChangesSQL, "100", 0, changeFeedBatch)
 	if err != nil {
 		t.Fatalf("EXPLAIN failed: %v", err)
@@ -581,10 +592,12 @@ func TestPollQueryPlanStaysOnIndex(t *testing.T) {
 		plan.WriteString(line)
 		plan.WriteString("\n")
 	}
-	if got := plan.String(); strings.Contains(got, "::text") {
+	got := plan.String()
+	if strings.Contains(got, "::text") {
 		t.Errorf("poll plan sorts by a text expression (output-column shadowing is back):\n%s", got)
-	} else if strings.Contains(got, "Seq Scan") {
-		t.Errorf("poll plan does not use the (xid, seq) index:\n%s", got)
+	}
+	if !strings.Contains(got, "Merge Append") {
+		t.Errorf("poll plan is not an index-ordered Merge Append:\n%s", got)
 	}
 }
 
