@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS workers (
 -- (xid, seq) cursor;
 -- payload is a JSON envelope: {"t": <event type>, "w": <protojson Worker>}.
 --
--- Partitioned hourly by created_at so retention is a partition DROP — a
+-- Partitioned by created_at range (width: changeFeedPartitionInterval,
+-- kept <= retention so rows outlive it by at most one interval) so
+-- retention is a partition DROP — a
 -- metadata operation with no row deletes, dead tuples, or vacuum debt —
 -- instead of bulk DELETEs whose I/O competes with foreground traffic. The
 -- maintenance loop (changeFeedMaintenance) creates upcoming partitions and drops expired
@@ -97,21 +99,33 @@ CREATE TABLE IF NOT EXISTS workers (
 CREATE TABLE IF NOT EXISTS worker_changes (
     seq         bigint GENERATED ALWAYS AS IDENTITY,
     xid         xid8 NOT NULL DEFAULT pg_current_xact_id(),
-    created_at  timestamptz NOT NULL DEFAULT now(),
+    -- clock_timestamp(), not now(): now() is transaction-START time, so a
+    -- slow transaction would route its event by a stale timestamp — worst
+    -- case into an already-dropped partition (the DEFAULT partition would
+    -- catch it). The feed insert is the last statement before commit, so
+    -- statement time routes into the partition closest to commit time.
+    created_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
     payload     bytea NOT NULL
 ) PARTITION BY RANGE (created_at);
 
 CREATE INDEX IF NOT EXISTS worker_changes_xid_seq ON worker_changes (xid, seq);
 
-CREATE UNLOGGED TABLE IF NOT EXISTS worker_changes_pdefault PARTITION OF worker_changes DEFAULT;
+CREATE UNLOGGED TABLE IF NOT EXISTS worker_changes_default PARTITION OF worker_changes DEFAULT;
 
--- Single-row high-water mark of retention: the greatest seq ever discarded
--- from worker_changes (dropped with an hourly partition, or row-trimmed
+-- Single-row high-water mark of retention: the greatest row ever discarded
+-- from worker_changes (dropped with an expired partition, or row-trimmed
 -- from the DEFAULT partition). Watchers compare it against their cursor to
 -- detect (exactly, without inferring from identity gaps) that unconsumed
 -- rows were discarded out from under them.
+--
+-- The mark is an (xid, seq) TUPLE — the watch cursor's own ordering — not
+-- max(seq): xids are taken at a transaction's first write and seqs at its
+-- later feed insert, so seq order and delivery order diverge under
+-- concurrency, and a seq-only mark misfires in both directions against a
+-- (xid, seq) cursor.
 CREATE TABLE IF NOT EXISTS worker_changes_trim (
     id   boolean PRIMARY KEY DEFAULT true CHECK (id),
+    xid  xid8 NOT NULL,
     seq  bigint NOT NULL
 );
 
@@ -129,6 +143,17 @@ func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("beginning atepg schema transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	// The schema needs PostgreSQL 17+ (identity column on a partitioned
+	// table); fail with a clear message rather than an opaque partition
+	// DDL error.
+	var version int
+	if err := tx.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&version); err != nil {
+		return fmt.Errorf("reading PostgreSQL version: %w", err)
+	}
+	if version < 170000 {
+		return fmt.Errorf("atepg requires PostgreSQL 17 or newer (identity columns on partitioned tables); server_version_num is %d", version)
+	}
 
 	// Multiple ateapi replicas can start against an empty database together.
 	// PostgreSQL's IF NOT EXISTS does not eliminate every concurrent-DDL race,

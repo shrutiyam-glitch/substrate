@@ -307,7 +307,7 @@ func TestWorkerChangesPartitionRetention(t *testing.T) {
 	}
 	var staleSeq int64
 	if err := s.pool.QueryRow(ctx, `INSERT INTO worker_changes (payload, created_at) VALUES ($1, $2) RETURNING seq`,
-		[]byte("old"), stale.Truncate(time.Hour).Add(time.Minute)).Scan(&staleSeq); err != nil {
+		[]byte("old"), stale).Scan(&staleSeq); err != nil {
 		t.Fatalf("inserting aged row failed: %v", err)
 	}
 	// An aged stray in the DEFAULT partition (no hourly partition covers a
@@ -347,6 +347,289 @@ func TestWorkerChangesPartitionRetention(t *testing.T) {
 	}
 }
 
+// TestChangeFeedMaintenance_SingleMaintainer verifies the retention
+// election: while another replica holds the advisory lock, a pass skips
+// retention cleanly (no error, nothing dropped); once released, the next
+// pass does the work. (Partition creation is deliberately unelected.)
+func TestChangeFeedMaintenance_SingleMaintainer(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	stale := time.Now().UTC().Add(-2 * time.Hour)
+	if err := s.createWorkerChangesPartitions(ctx, stale); err != nil {
+		t.Fatalf("creating stale partition failed: %v", err)
+	}
+
+	// Another "replica" mid-pass: hold the advisory lock in an open
+	// transaction of our own.
+	holder, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin holder failed: %v", err)
+	}
+	defer holder.Rollback(ctx) //nolint:errcheck // released below
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database() || ':' || $1))`, changeFeedMaintenanceLockKey); err != nil {
+		t.Fatalf("taking maintenance lock failed: %v", err)
+	}
+
+	if err := s.maintainWorkerChangesPartitions(ctx); err != nil {
+		t.Fatalf("pass with lock held must skip cleanly, got: %v", err)
+	}
+	var staleExists bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, workerChangesPartitionName(stale)).Scan(&staleExists); err != nil {
+		t.Fatalf("checking stale partition failed: %v", err)
+	}
+	if !staleExists {
+		t.Fatal("stale partition was dropped by a pass that lost the election")
+	}
+
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatalf("releasing maintenance lock failed: %v", err)
+	}
+	if err := s.maintainWorkerChangesPartitions(ctx); err != nil {
+		t.Fatalf("pass after lock release failed: %v", err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, workerChangesPartitionName(stale)).Scan(&staleExists); err != nil {
+		t.Fatalf("re-checking stale partition failed: %v", err)
+	}
+	if staleExists {
+		t.Error("stale partition survived a pass that held the election")
+	}
+}
+
+// TestWatchWorkers_TrimMarkUsesCursorOrdering is the regression test for
+// the trim mark and the cursor disagreeing on ordering. The cursor
+// advances in (xid, seq) delivery order, in which seq can regress: here
+// the watcher consumes (xid_a, s3) while (xid_b, s2) — later xid, earlier
+// seq — is discarded unconsumed. A seq-only trim mark (s2) compared
+// against cursorSeq (s3) would stay silent and the event would be lost;
+// the (xid, seq) tuple mark must close the watch for resync.
+func TestWatchWorkers_TrimMarkUsesCursorOrdering(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	watch, err := s.WatchWorkers(ctx)
+	if err != nil {
+		t.Fatalf("WatchWorkers failed: %v", err)
+	}
+	defer watch.Close()
+
+	mkPayload := func(pod string) []byte {
+		payload, err := marshalWorkerEvent(store.WorkerEventCreated,
+			&ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: pod})
+		if err != nil {
+			t.Fatalf("marshaling event for %q: %v", pod, err)
+		}
+		return payload
+	}
+
+	// txA takes its xid first (xid_a)...
+	txA, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin txA failed: %v", err)
+	}
+	defer txA.Rollback(ctx) //nolint:errcheck // no-op once committed
+	if _, err := txA.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+		t.Fatalf("assigning txA xid failed: %v", err)
+	}
+	// ...then txB (xid_b > xid_a) takes the earlier feed seq (s2)...
+	txB, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin txB failed: %v", err)
+	}
+	defer txB.Rollback(ctx) //nolint:errcheck // no-op once committed
+	var bXid string
+	var bSeq int64
+	if err := txB.QueryRow(ctx, `INSERT INTO worker_changes (payload) VALUES ($1) RETURNING xid::text, seq`, mkPayload("discarded")).Scan(&bXid, &bSeq); err != nil {
+		t.Fatalf("txB feed insert failed: %v", err)
+	}
+	// ...and txA takes the later seq (s3) and commits.
+	if _, err := txA.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("consumed")); err != nil {
+		t.Fatalf("txA feed insert failed: %v", err)
+	}
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatalf("txA Commit failed: %v", err)
+	}
+
+	// txA's row clears the fence while txB is still open; the cursor
+	// advances to (xid_a, s3) — cursorSeq now EXCEEDS txB's s2.
+	select {
+	case event := <-watch.Events:
+		if got := event.Worker.GetWorkerPod(); got != "consumed" {
+			t.Fatalf("delivered %q, want %q", got, "consumed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for txA's event")
+	}
+
+	// txB discards its own row and records the trim mark atomically —
+	// a committed-but-never-consumable event, as if retention took it.
+	if _, err := txB.Exec(ctx, `DELETE FROM worker_changes WHERE seq = $1`, bSeq); err != nil {
+		t.Fatalf("txB discard failed: %v", err)
+	}
+	if _, err := txB.Exec(ctx, `
+		INSERT INTO worker_changes_trim (xid, seq) VALUES ($1::xid8, $2)
+		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid, seq = EXCLUDED.seq
+		WHERE (EXCLUDED.xid, EXCLUDED.seq) > (worker_changes_trim.xid, worker_changes_trim.seq)`, bXid, bSeq); err != nil {
+		t.Fatalf("txB trim mark failed: %v", err)
+	}
+	if err := txB.Commit(ctx); err != nil {
+		t.Fatalf("txB Commit failed: %v", err)
+	}
+
+	select {
+	case event, ok := <-watch.Events:
+		if ok {
+			t.Fatalf("unexpected event %+v; want the channel closed for resync", event)
+		}
+		// Expected: (xid_b, s2) > (xid_a, s3) tuple-wise, so the watch
+		// closed — a seq-only comparison (s2 < s3) would have missed it.
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch did not close: the trim mark comparison missed a discarded row whose seq is below the cursor")
+	}
+}
+
+// TestWatchWorkers_DeliveryFencedByOldestTransaction documents the xmin
+// fence's real bound: one old transaction anywhere holds back delivery of
+// everything committed after it, for as long as it lives.
+func TestWatchWorkers_DeliveryFencedByOldestTransaction(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	watch, err := s.WatchWorkers(ctx)
+	if err != nil {
+		t.Fatalf("WatchWorkers failed: %v", err)
+	}
+	defer watch.Close()
+
+	// An unrelated transaction that merely holds an xid.
+	blocker, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin blocker failed: %v", err)
+	}
+	defer blocker.Rollback(ctx) //nolint:errcheck // released below
+	if _, err := blocker.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+		t.Fatalf("assigning blocker xid failed: %v", err)
+	}
+
+	worker := &ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "fenced"}
+	if err := s.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+
+	select {
+	case event := <-watch.Events:
+		t.Fatalf("event %+v delivered through the fence while an older transaction was in flight", event)
+	case <-time.After(600 * time.Millisecond):
+		// Expected: committed but fenced behind the blocker's xid.
+	}
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("ending blocker failed: %v", err)
+	}
+	select {
+	case event := <-watch.Events:
+		if got := event.Worker.GetWorkerPod(); got != "fenced" {
+			t.Errorf("delivered %q, want %q", got, "fenced")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("event not delivered after the fencing transaction ended")
+	}
+}
+
+// TestClose_StopsMaintenance pins that Close ends the background
+// maintenance goroutine (main.go defers it for exactly this): Close blocks
+// on the loop's done channel, so its return IS the assertion.
+func TestClose_StopsMaintenance(t *testing.T) {
+	ctx := context.Background()
+	p, err := NewPersistence(ctx, requirePool(t))
+	if err != nil {
+		t.Fatalf("NewPersistence failed: %v", err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not stop the maintenance loop")
+	}
+}
+
+// TestPollQueryPlanStaysOnIndex pins the poll's plan shape against the
+// output-column shadowing bug: an unaliased xid::text captures the bare
+// ORDER BY name, sorting xids as text — which both diverges from the
+// cursor predicate's xid8 order (silently skipping events across digit
+// boundaries) and forces full scans with a top-N sort. Behavioural tests
+// cannot see this; the plan can.
+func TestPollQueryPlanStaysOnIndex(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	rows, err := s.pool.Query(ctx, "EXPLAIN "+pollWorkerChangesSQL, "100", 0, changeFeedBatch)
+	if err != nil {
+		t.Fatalf("EXPLAIN failed: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scanning plan line: %v", err)
+		}
+		plan.WriteString(line)
+		plan.WriteString("\n")
+	}
+	if got := plan.String(); strings.Contains(got, "::text") {
+		t.Errorf("poll plan sorts by a text expression (output-column shadowing is back):\n%s", got)
+	} else if strings.Contains(got, "Seq Scan") {
+		t.Errorf("poll plan does not use the (xid, seq) index:\n%s", got)
+	}
+}
+
+// TestChangeFeedMaintenance_ConcurrentPassesAreHarmless backs the doc's
+// claim: two replicas racing a maintenance pass produce no errors and the
+// correct end state (one wins the election, the loser skips).
+func TestChangeFeedMaintenance_ConcurrentPassesAreHarmless(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := context.Background()
+
+	replica, err := NewPersistence(ctx, s.pool)
+	if err != nil {
+		t.Fatalf("second Persistence failed: %v", err)
+	}
+	t.Cleanup(replica.Close)
+
+	stale := time.Now().UTC().Add(-2 * time.Hour)
+	if err := s.createWorkerChangesPartitions(ctx, stale); err != nil {
+		t.Fatalf("creating stale partition failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, p := range []*Persistence{s, replica} {
+		wg.Add(1)
+		go func(i int, p *Persistence) {
+			defer wg.Done()
+			errs[i] = p.maintainWorkerChangesPartitions(ctx)
+		}(i, p)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent pass %d returned error: %v", i, err)
+		}
+	}
+	var staleExists bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, workerChangesPartitionName(stale)).Scan(&staleExists); err != nil {
+		t.Fatalf("checking stale partition failed: %v", err)
+	}
+	if staleExists {
+		t.Error("stale partition survived both concurrent passes")
+	}
+}
+
 // TestWorkerChangesPartitionsAreUnlogged pins the maintenance profile the
 // schema documents: every feed partition must be UNLOGGED (relpersistence
 // 'u'); hourly partitions must have autovacuum disabled (insert-only,
@@ -377,7 +660,7 @@ func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
 			t.Errorf("partition %s has relpersistence %q, want 'u' (unlogged)", name, persistence)
 		}
 		autovacuumOff := strings.Contains(options, "autovacuum_enabled=off")
-		if name == "worker_changes_pdefault" {
+		if name == "worker_changes_default" {
 			if autovacuumOff {
 				t.Errorf("DEFAULT partition has autovacuum disabled; it must keep it (rows are deleted in place there)")
 			}
@@ -398,53 +681,13 @@ func TestWorkerChangesPartitionsAreUnlogged(t *testing.T) {
 	}
 }
 
-// TestWatchWorkers_ClosesOnPersistentPollFailure verifies the crash escape
-// hatch: a database restart truncates the UNLOGGED feed, so a watch that
-// cannot reach the feed for changeFeedMaxPollFailures consecutive polls
-// must close its channel (consumers resync) instead of riding its stale
-// cursor over silently discarded events. Simulated by closing the
-// watcher's pool out from under it.
-func TestWatchWorkers_ClosesOnPersistentPollFailure(t *testing.T) {
-	requirePool(t) // ensure the shared container exists
-	ctx := context.Background()
-	dsn, err := containerPG.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("container DSN: %v", err)
-	}
-	// A private pool so closing it cannot disturb other tests.
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("opening private pool: %v", err)
-	}
-	p, err := NewPersistence(ctx, pool)
-	if err != nil {
-		pool.Close()
-		t.Fatalf("NewPersistence failed: %v", err)
-	}
-	t.Cleanup(p.Close)
-
-	watch, err := p.WatchWorkers(ctx)
-	if err != nil {
-		pool.Close()
-		t.Fatalf("WatchWorkers failed: %v", err)
-	}
-	defer watch.Close()
-
-	pool.Close() // every poll fails from here on
-
-	deadline := time.After(changeFeedMaxPollFailures*changeFeedPollInterval + 10*time.Second)
-	for {
-		select {
-		case event, ok := <-watch.Events:
-			if !ok {
-				return // expected: channel closed for resync
-			}
-			t.Fatalf("unexpected event %+v from a watch whose pool is closed", event)
-		case <-deadline:
-			t.Fatal("watch channel did not close after sustained poll failure")
-		}
-	}
-}
+// The restart escape hatch (a changed pg_postmaster_start_time() closes
+// the watch, because a restart truncates the UNLOGGED feed) has no e2e
+// test here: restarting the testcontainer remaps its host port, severing
+// the pool permanently — unlike production, where the database endpoint is
+// stable across restarts. The comparison itself is four lines in
+// WatchWorkers' poll loop; the trimmed-past-cursor test below covers the
+// shared close-for-resync path.
 
 // TestWatchWorkers_ClosesWhenTrimmedPastCursor verifies the retention
 // escape hatch: when rows a watcher has not consumed are deleted out from
@@ -487,14 +730,17 @@ func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1), ($1), ($1)`, payload); err != nil {
 		t.Fatalf("feed inserts failed: %v", err)
 	}
+	// Mirrors trimWorkerChangesDefault's shape: the mark is the deleted
+	// set's greatest (xid, seq).
 	if _, err := tx.Exec(ctx, `
 		WITH doomed AS (
 			DELETE FROM worker_changes WHERE seq < (SELECT max(seq) FROM worker_changes)
-			RETURNING seq
+			RETURNING xid, seq
 		)
-		INSERT INTO worker_changes_trim (seq)
-		SELECT max(seq) FROM doomed HAVING count(*) > 0
-		ON CONFLICT (id) DO UPDATE SET seq = GREATEST(worker_changes_trim.seq, EXCLUDED.seq)`); err != nil {
+		INSERT INTO worker_changes_trim (xid, seq)
+		SELECT xid, seq FROM doomed ORDER BY xid DESC, seq DESC LIMIT 1
+		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid, seq = EXCLUDED.seq
+		WHERE (EXCLUDED.xid, EXCLUDED.seq) > (worker_changes_trim.xid, worker_changes_trim.seq)`); err != nil {
 		t.Fatalf("trim failed: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
