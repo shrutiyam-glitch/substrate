@@ -262,3 +262,22 @@ checkpoint → flags) has made the result reproducible, not just good.
 15-min partitions routing correctly (DEFAULT 0 bytes; ~1.3KB/row holds).
 Legacy hourly partitions (~1.25GB) linger by design — new code ignores
 their names; drop manually at next cleanup.
+
+### Simplified feed validation pair (2026-08-14, tip 0dca1209)
+
+Four simplification commits (xid-only cursor replacing (xid,seq) — with a
+subscribe off-by-one found and fixed en route; DEFAULT partition TRUNCATE
+replacing the never-drains row trim; in-watch stall observability deleted,
+safety scalars unconditional; binary payloads replacing the JSON envelope
+— ~175 net lines removed, version floor PG17→13). atepg_v2 retrofit was
+one additive ALTER (trim.seq default).
+
+| run | p50 | p90 | p95 | p99 | p99.9 |
+|---|---|---|---|---|---|
+| 1 | 7.38 | 8.64 | 9.24 | 11.59 | 34.1 |
+| 2 | 7.08 | 7.98 | 8.40 | 11.36 | 49.4 |
+
+Statistically identical to the pre-simplification pair (7.25/10.42,
+7.36/10.71) — the entire simplification arc is latency-neutral, and
+pair-consistency holds (p50/p90/p95 within ~0.4ms across runs). This is
+the configuration of record for the PR.
