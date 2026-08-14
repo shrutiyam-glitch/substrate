@@ -92,8 +92,8 @@ func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, erro
 	return p, nil
 }
 
-// Close stops background maintenance (the change-feed maintenance loop). It does not
-// close the pool, which the caller owns.
+// Close stops the change-feed maintenance loop. It does not close the
+// pool, which the caller owns.
 func (p *Persistence) Close() {
 	p.stopMaintenance()
 }
@@ -1012,7 +1012,7 @@ func (p *Persistence) DeleteWorker(ctx context.Context, namespace, poolName, pod
 			RETURNING proto`, namespace, poolName, pod).Scan(&protoBytes)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// Idempotent: nothing existed, so nothing to notify either.
+				// Idempotent: nothing existed, so no event to publish either.
 				return false, nil
 			}
 			return false, fmt.Errorf("deleting worker %s/%s/%s: %w", namespace, poolName, pod, err)
