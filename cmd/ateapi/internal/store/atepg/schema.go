@@ -72,23 +72,23 @@ CREATE TABLE IF NOT EXISTS workers (
 );
 
 -- Transactional change feed backing WatchWorkers. Events are appended in
--- the same transaction as the worker write and delivered by polling past a
--- (xid, seq) cursor;
+-- the same transaction as the worker write and delivered by polling past
+-- an xid cursor;
 -- payload is a JSON envelope: {"t": <event type>, "w": <protojson Worker>}.
+--
+-- xid is the whole ordering: writeAndAppendChange appends exactly ONE row
+-- per transaction (the only insert site), so every feed row has a distinct
+-- xid and a poll batch can never split a same-xid group. That invariant is
+-- load-bearing for the watch cursor and pinned by a test.
 --
 -- Partitioned by created_at range (width: changeFeedPartitionInterval,
 -- kept <= retention so rows outlive it by at most one interval) so
--- retention is a partition DROP — a
--- metadata operation with no row deletes, dead tuples, or vacuum debt —
--- instead of bulk DELETEs whose I/O competes with foreground traffic. The
--- maintenance loop (changeFeedMaintenance) creates upcoming partitions and drops expired
+-- retention is a partition DROP — a metadata operation with no row
+-- deletes, dead tuples, or vacuum debt — instead of bulk DELETEs whose I/O
+-- competes with foreground traffic. The maintenance loop
+-- (changeFeedMaintenance) creates upcoming partitions and drops expired
 -- ones; the DEFAULT partition only receives writes if partition creation
 -- ever stalls, and is trimmed row-wise as a fallback.
---
--- seq has no PRIMARY KEY: a unique constraint on a partitioned table must
--- include the partition key, and uniqueness already holds by construction
--- (one identity sequence). Requires PostgreSQL 17+ (identity column on a
--- partitioned table).
 --
 -- Partitions are UNLOGGED: the feed is ephemeral by design (cursors are
 -- not durable, subscriptions start "from now", and every consumer rebuilds
@@ -97,7 +97,6 @@ CREATE TABLE IF NOT EXISTS workers (
 -- unlogged tables; see WatchWorkers for how watchers recover.
 -- worker_changes_trim stays logged — the trim mark must survive a crash.
 CREATE TABLE IF NOT EXISTS worker_changes (
-    seq         bigint GENERATED ALWAYS AS IDENTITY,
     xid         xid8 NOT NULL DEFAULT pg_current_xact_id(),
     -- clock_timestamp(), not now(): now() is transaction-START time, so a
     -- slow transaction would route its event by a stale timestamp — worst
@@ -108,25 +107,17 @@ CREATE TABLE IF NOT EXISTS worker_changes (
     payload     bytea NOT NULL
 ) PARTITION BY RANGE (created_at);
 
-CREATE INDEX IF NOT EXISTS worker_changes_xid_seq ON worker_changes (xid, seq);
+CREATE INDEX IF NOT EXISTS worker_changes_xid ON worker_changes (xid);
 
 CREATE UNLOGGED TABLE IF NOT EXISTS worker_changes_default PARTITION OF worker_changes DEFAULT;
 
--- Single-row high-water mark of retention: the greatest row ever discarded
+-- Single-row high-water mark of retention: the greatest xid ever discarded
 -- from worker_changes (dropped with an expired partition, or row-trimmed
 -- from the DEFAULT partition). Watchers compare it against their cursor to
--- detect (exactly, without inferring from identity gaps) that unconsumed
--- rows were discarded out from under them.
---
--- The mark is an (xid, seq) TUPLE — the watch cursor's own ordering — not
--- max(seq): xids are taken at a transaction's first write and seqs at its
--- later feed insert, so seq order and delivery order diverge under
--- concurrency, and a seq-only mark misfires in both directions against a
--- (xid, seq) cursor.
+-- detect exactly that unconsumed rows were discarded out from under them.
 CREATE TABLE IF NOT EXISTS worker_changes_trim (
     id   boolean PRIMARY KEY DEFAULT true CHECK (id),
-    xid  xid8 NOT NULL,
-    seq  bigint NOT NULL
+    xid  xid8 NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS leases (
@@ -144,15 +135,15 @@ func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
-	// The schema needs PostgreSQL 17+ (identity column on a partitioned
-	// table); fail with a clear message rather than an opaque partition
-	// DDL error.
+	// The schema needs PostgreSQL 13+ (xid8, pg_current_xact_id,
+	// pg_current_snapshot); fail with a clear message rather than an
+	// opaque DDL or function error.
 	var version int
 	if err := tx.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&version); err != nil {
 		return fmt.Errorf("reading PostgreSQL version: %w", err)
 	}
-	if version < 170000 {
-		return fmt.Errorf("atepg requires PostgreSQL 17 or newer (identity columns on partitioned tables); server_version_num is %d", version)
+	if version < 130000 {
+		return fmt.Errorf("atepg requires PostgreSQL 13 or newer (xid8 and pg_current_snapshot); server_version_num is %d", version)
 	}
 
 	// Multiple ateapi replicas can start against an empty database together.

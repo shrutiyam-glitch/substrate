@@ -889,6 +889,14 @@ func unmarshalWorkerEvent(payload []byte) (store.WorkerEvent, error) {
 // reports a change worth publishing--appends the event to the worker_changes
 // feed in the same transaction, so watchers see it if and only if the
 // transaction commits.
+//
+// INVARIANT (load-bearing): this is the only site that inserts into
+// worker_changes, and it appends exactly ONE row per transaction — so
+// every feed row has a distinct xid, and the watch cursor can be the xid
+// alone (a poll batch can never split a same-xid group). A future bulk
+// write API must not batch multiple feed rows into one transaction
+// without revisiting WatchWorkers. Pinned by
+// TestWorkerEvents_OneRowPerTransaction.
 func (p *Persistence) writeAndAppendChange(ctx context.Context, eventType store.WorkerEventType, worker *ateapipb.Worker, fn func(ctx context.Context, tx pgx.Tx) (changed bool, err error)) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -1166,13 +1174,13 @@ const changeFeedMaintenanceLockKey = "atepg-change-feed-maintenance"
 // sorting xids AS TEXT — which diverges from the xid8 order the cursor
 // predicate uses whenever digit counts differ ("999" > "1000"), skipping
 // events at digit boundaries, and forces a full-scan top-N sort instead of
-// a Merge Append over the (xid, seq) index. TestPollQueryPlanStaysOnIndex
+// a Merge Append over the xid index. TestPollQueryPlanStaysOnIndex
 // pins this.
 const pollWorkerChangesSQL = `
-	SELECT seq, xid::text AS xid_text, payload FROM worker_changes
-	WHERE (xid, seq) > ($1::xid8, $2)
+	SELECT xid::text AS xid_text, payload FROM worker_changes
+	WHERE xid > $1::xid8
 	  AND xid < pg_snapshot_xmin(pg_current_snapshot())
-	ORDER BY xid, seq LIMIT $3`
+	ORDER BY xid LIMIT $2`
 
 // pollSafetySQL returns the watch's safety scalars: the fell-behind check
 // (tuple-wise in the cursor's own ordering, firing iff the trim mark is
@@ -1182,10 +1190,10 @@ const pollWorkerChangesSQL = `
 const pollSafetySQL = `
 	SELECT EXISTS(
 		SELECT 1 FROM worker_changes_trim
-		WHERE (xid, seq) > ($1::xid8, $2) AND (xid, seq) > ($3::xid8, $4)),
+		WHERE xid > $1::xid8 AND xid > $2::xid8),
 	EXISTS(
 		SELECT 1 FROM worker_changes
-		WHERE (xid, seq) > ($1::xid8, $2)
+		WHERE xid > $1::xid8
 		  AND xid >= pg_snapshot_xmin(pg_current_snapshot())),
 	pg_snapshot_xmin(pg_current_snapshot())::text,
 	pg_postmaster_start_time()::text`
@@ -1303,9 +1311,9 @@ func (p *Persistence) createWorkerChangesPartitions(ctx context.Context, instant
 
 // dropExpiredWorkerChangesPartitions drops every feed partition whose
 // entire range is older than retention. Each drop first records the
-// partition's greatest seq in worker_changes_trim, in the same transaction,
-// so watchers can detect exactly (not by inferring from identity gaps,
-// which rollbacks burn) that rows were discarded past their cursor.
+// partition's greatest xid in worker_changes_trim, in the same
+// transaction, so watchers can detect exactly that rows were discarded
+// past their cursor.
 func (p *Persistence) dropExpiredWorkerChangesPartitions(ctx context.Context, q querier, now time.Time) error {
 	rows, err := q.Query(ctx, `
 		SELECT c.relname FROM pg_inherits i
@@ -1354,16 +1362,15 @@ func (p *Persistence) dropExpiredWorkerChangesPartitions(ctx context.Context, q 
 // partition on the caller's (elected, single) retention transaction.
 func (p *Persistence) dropWorkerChangesPartition(ctx context.Context, q querier, name string) error {
 	ident := pgx.Identifier{name}.Sanitize()
-	// The mark is the partition's greatest (xid, seq) — the cursor's own
-	// ordering; see the worker_changes_trim schema comment. The ORDER
-	// BY/LIMIT is a backward scan on the (xid, seq) index, and yields no
-	// row (so the INSERT is a no-op) for an empty partition. The upsert's
-	// WHERE keeps the mark monotone in tuple order.
+	// The mark is the partition's greatest xid. The ORDER BY/LIMIT is a
+	// backward scan on the xid index (and keeps the version floor at 13 —
+	// max(xid8) needs 14), yielding no row (so the INSERT is a no-op) for
+	// an empty partition. The upsert's WHERE keeps the mark monotone.
 	if _, err := q.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO worker_changes_trim (xid, seq)
-		SELECT xid, seq FROM %s ORDER BY xid DESC, seq DESC LIMIT 1
-		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid, seq = EXCLUDED.seq
-		WHERE (EXCLUDED.xid, EXCLUDED.seq) > (worker_changes_trim.xid, worker_changes_trim.seq)`, ident)); err != nil {
+		INSERT INTO worker_changes_trim (xid)
+		SELECT xid FROM %s ORDER BY xid DESC LIMIT 1
+		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid
+		WHERE EXCLUDED.xid > worker_changes_trim.xid`, ident)); err != nil {
 		return fmt.Errorf("recording trim mark for feed partition %s: %w", name, err)
 	}
 	if _, err := q.Exec(ctx, `DROP TABLE `+ident); err != nil {
@@ -1378,38 +1385,35 @@ func (p *Persistence) dropWorkerChangesPartition(ctx context.Context, q querier,
 // Empty in normal operation, and deliberately ONE batch per pass: draining
 // a backlog in a loop would recreate the bulk-delete I/O burst that
 // partition-drop retention exists to avoid, and the next pass is a minute
-// away. The trim mark — the deleted set's greatest (xid, seq), the
-// cursor's own ordering — is recorded in the same statement, so loss
-// detection stays exact.
+// away. The trim mark — the deleted set's greatest xid — is recorded in
+// the same statement, so loss detection stays exact.
 func (p *Persistence) trimWorkerChangesDefault(ctx context.Context, q querier) error {
 	if _, err := q.Exec(ctx, `
 		WITH doomed AS (
-			DELETE FROM worker_changes_default WHERE seq IN (
-				SELECT seq FROM worker_changes_default
+			DELETE FROM worker_changes_default WHERE xid IN (
+				SELECT xid FROM worker_changes_default
 				WHERE created_at < now() - make_interval(secs => $1)
-				ORDER BY seq LIMIT $2)
-			RETURNING xid, seq
+				ORDER BY xid LIMIT $2)
+			RETURNING xid
 		)
-		INSERT INTO worker_changes_trim (xid, seq)
-		SELECT xid, seq FROM doomed ORDER BY xid DESC, seq DESC LIMIT 1
-		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid, seq = EXCLUDED.seq
-		WHERE (EXCLUDED.xid, EXCLUDED.seq) > (worker_changes_trim.xid, worker_changes_trim.seq)`,
+		INSERT INTO worker_changes_trim (xid)
+		SELECT xid FROM doomed ORDER BY xid DESC LIMIT 1
+		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid
+		WHERE EXCLUDED.xid > worker_changes_trim.xid`,
 		changeFeedRetentionAge.Seconds(), changeFeedDefaultTrimBatch); err != nil {
 		return fmt.Errorf("trimming feed default partition: %w", err)
 	}
 	return nil
 }
 
-// WatchWorkers subscribes by polling the worker_changes feed table past a
-// (xid, seq) cursor. Events are appended to the feed in the same transaction
-// as the worker write (see writeAndAppendChange), so delivery happens iff
-// the write committed.
-//
-// The cursor is (xid, seq), not seq alone: seq is allocated at INSERT but
-// the row only becomes visible at COMMIT, so a seq cursor can move past a
-// still-in-flight lower seq and lose its event permanently. Each poll only
-// consumes rows whose xid is older than every in-flight transaction
-// (pg_snapshot_xmin), so nothing visible can ever appear behind the cursor.
+// WatchWorkers subscribes by polling the worker_changes feed table past an
+// xid cursor. Events are appended to the feed in the same transaction as
+// the worker write (see writeAndAppendChange), so delivery happens iff the
+// write committed — and because that site appends exactly one row per
+// transaction, xids are distinct per row and the xid alone is a total,
+// batch-safe ordering. Each poll only consumes rows whose xid is older
+// than every in-flight transaction (pg_snapshot_xmin), so nothing visible
+// can ever appear behind the cursor.
 //
 // That fence is the price of gap-freedom, and it is CLUSTER-WIDE:
 // pg_snapshot_xmin is the oldest in-flight transaction anywhere on the
@@ -1441,33 +1445,29 @@ func (p *Persistence) trimWorkerChangesDefault(ctx context.Context, q querier) e
 func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, error) {
 	watchCtx, cancel := context.WithCancel(ctx)
 
-	// Start at (xmin, 0): everything committed before every in-flight
+	// Start at xmin - 1: everything committed before every in-flight
 	// transaction is history; anything in flight at subscribe time has
-	// xid >= xmin and is delivered once it clears the fence. The baseline
-	// tuple records where the feed (and any past trimming) ended at
-	// subscribe time — greatest of the highest existing row and the
-	// recorded trim mark, in (xid, seq) order — so pre-subscribe trims are
-	// never mistaken for lost events.
+	// xid >= xmin and is delivered once it clears the fence. The minus
+	// one matters: on an idle system xmin is the NEXT unassigned xid, the
+	// very next transaction takes exactly that value, and the cursor
+	// predicate is exclusive (xid > cursor) — starting at xmin itself
+	// would silently skip the first post-subscribe event. The baseline
+	// records where the feed (and any past trimming) ended at subscribe
+	// time — greatest of the highest existing row and the recorded trim
+	// mark — so pre-subscribe trims are never mistaken for lost events.
 	// Xids stay decimal strings end to end: PostgreSQL produces them
 	// (::text), PostgreSQL consumes them ($n::xid8), and Go never needs
 	// the numbers — all ordering happens in SQL.
 	var cursorXid, baselineXid, baselineStart string
-	var baselineSeq int64
 	if err := p.pool.QueryRow(watchCtx, `
-		WITH high AS (
-			(SELECT xid, seq FROM worker_changes ORDER BY xid DESC, seq DESC LIMIT 1)
-			UNION ALL
-			(SELECT xid, seq FROM worker_changes_trim)
-			ORDER BY xid DESC, seq DESC LIMIT 1
-		)
-		SELECT pg_snapshot_xmin(pg_current_snapshot())::text,
-		       COALESCE((SELECT xid FROM high), '0'::xid8)::text,
-		       COALESCE((SELECT seq FROM high), 0),
-		       pg_postmaster_start_time()::text`).Scan(&cursorXid, &baselineXid, &baselineSeq, &baselineStart); err != nil {
+		SELECT (pg_snapshot_xmin(pg_current_snapshot())::text::numeric - 1)::text,
+		       GREATEST(
+		           COALESCE((SELECT xid FROM worker_changes ORDER BY xid DESC LIMIT 1), '0'::xid8),
+		           COALESCE((SELECT xid FROM worker_changes_trim), '0'::xid8))::text,
+		       pg_postmaster_start_time()::text`).Scan(&cursorXid, &baselineXid, &baselineStart); err != nil {
 		cancel()
 		return nil, fmt.Errorf("reading worker change feed cursor: %w", err)
 	}
-	var cursorSeq int64
 
 	ch := make(chan store.WorkerEvent, 128)
 	go func() {
@@ -1507,14 +1507,13 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 				// fully-trimmed gap needs detecting.
 				withSafety := active || !time.Now().Before(nextSafety)
 				b := &pgx.Batch{}
-				b.Queue(pollWorkerChangesSQL, cursorXid, cursorSeq, changeFeedBatch)
+				b.Queue(pollWorkerChangesSQL, cursorXid, changeFeedBatch)
 				if withSafety {
-					b.Queue(pollSafetySQL, cursorXid, cursorSeq, baselineXid, baselineSeq)
+					b.Queue(pollSafetySQL, cursorXid, baselineXid)
 				}
 				br := p.pool.SendBatch(watchCtx, b)
 
 				type feedRow struct {
-					seq     int64
 					xid     string
 					payload []byte
 				}
@@ -1523,7 +1522,7 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 				if err == nil {
 					for rows.Next() {
 						var r feedRow
-						if err = rows.Scan(&r.seq, &r.xid, &r.payload); err != nil {
+						if err = rows.Scan(&r.xid, &r.payload); err != nil {
 							batch = nil
 							break
 						}
@@ -1552,7 +1551,7 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 				if len(batch) > 0 && !withSafety {
 					// First delivery after an idle streak: fetch the
 					// safety scalars before delivering anything.
-					if err := p.pool.QueryRow(watchCtx, pollSafetySQL, cursorXid, cursorSeq, baselineXid, baselineSeq).Scan(&fellBehind, &heldBack, &xminNow, &pmStart); err != nil {
+					if err := p.pool.QueryRow(watchCtx, pollSafetySQL, cursorXid, baselineXid).Scan(&fellBehind, &heldBack, &xminNow, &pmStart); err != nil {
 						if watchCtx.Err() != nil {
 							return
 						}
@@ -1586,7 +1585,7 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 					// before delivering anything past the gap.
 					if fellBehind {
 						slog.WarnContext(watchCtx, "worker watch fell behind change feed retention; closing for resync",
-							slog.String("cursor_xid", cursorXid), slog.Int64("cursor_seq", cursorSeq))
+							slog.String("cursor_xid", cursorXid))
 						return
 					}
 				}
@@ -1595,12 +1594,12 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 					event, err := unmarshalWorkerEvent(r.payload)
 					if err != nil {
 						slog.ErrorContext(watchCtx, "worker event unmarshal failed", slog.Any("err", err))
-						cursorXid, cursorSeq = r.xid, r.seq
+						cursorXid = r.xid
 						continue
 					}
 					select {
 					case ch <- event:
-						cursorXid, cursorSeq = r.xid, r.seq
+						cursorXid = r.xid
 					case <-watchCtx.Done():
 						return
 					}

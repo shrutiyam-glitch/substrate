@@ -215,13 +215,13 @@ func TestWorkerEvent_OnlyAfterCommit(t *testing.T) {
 	}
 }
 
-// TestWatchWorkers_OutOfOrderCommitNotSkipped reproduces the seq-cursor gap:
-// feed seqs are allocated at INSERT but rows appear at COMMIT, so a
-// transaction holding a lower seq can commit after a higher-seq sibling. A
-// watcher whose cursor chased raw seq would advance past the in-flight row
-// and lose its event permanently. The (xid, seq) cursor must instead hold
-// the committed sibling back until the older transaction resolves, then
-// deliver both in order.
+// TestWatchWorkers_OutOfOrderCommitNotSkipped reproduces the commit-order
+// gap: xids are assigned at a transaction's first write but rows appear at
+// COMMIT, so a transaction holding a lower xid can commit after a
+// higher-xid sibling. A watcher that advanced past every visible row would
+// skip the in-flight one and lose its event permanently. The xmin fence
+// must instead hold the committed sibling back until the older
+// transaction resolves, then deliver both in order.
 func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 	s := setupPostgresStore(t).(*Persistence)
 	ctx := context.Background()
@@ -241,22 +241,22 @@ func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 		return payload
 	}
 
-	// tx1 appends first (lower seq, lower xid) and stays open.
+	// tx1 appends first (lower xid) and stays open.
 	tx1, err := s.pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin tx1 failed: %v", err)
 	}
 	defer tx1.Rollback(ctx) //nolint:errcheck // no-op once committed
-	if _, err := tx1.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("first-seq-late-commit")); err != nil {
+	if _, err := tx1.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("first-xid-late-commit")); err != nil {
 		t.Fatalf("tx1 feed insert failed: %v", err)
 	}
 
-	// tx2 appends second (higher seq) and commits immediately.
+	// tx2 appends second (higher xid) and commits immediately.
 	tx2, err := s.pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin tx2 failed: %v", err)
 	}
-	if _, err := tx2.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("second-seq-early-commit")); err != nil {
+	if _, err := tx2.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("second-xid-early-commit")); err != nil {
 		t.Fatalf("tx2 feed insert failed: %v", err)
 	}
 	if err := tx2.Commit(ctx); err != nil {
@@ -285,7 +285,7 @@ func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 			t.Fatalf("timed out waiting for both events; delivered so far: %v", got)
 		}
 	}
-	want := []string{"first-seq-late-commit", "second-seq-early-commit"}
+	want := []string{"first-xid-late-commit", "second-xid-early-commit"}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("event delivery order mismatch (-want +got):\n%s", diff)
 	}
@@ -293,7 +293,7 @@ func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 
 // TestWorkerChangesPartitionRetention verifies partition-based
 // retention: an hourly partition wholly past changeFeedRetentionAge is
-// dropped (with its greatest seq recorded in worker_changes_trim), fresh
+// dropped (with its greatest xid recorded in worker_changes_trim), fresh
 // rows survive, and aged strays in the DEFAULT partition are trimmed by the
 // row-wise fallback.
 func TestWorkerChangesPartitionRetention(t *testing.T) {
@@ -305,9 +305,9 @@ func TestWorkerChangesPartitionRetention(t *testing.T) {
 	if err := s.createWorkerChangesPartitions(ctx, stale); err != nil {
 		t.Fatalf("creating stale partition failed: %v", err)
 	}
-	var staleSeq int64
-	if err := s.pool.QueryRow(ctx, `INSERT INTO worker_changes (payload, created_at) VALUES ($1, $2) RETURNING seq`,
-		[]byte("old"), stale).Scan(&staleSeq); err != nil {
+	var staleXid string
+	if err := s.pool.QueryRow(ctx, `INSERT INTO worker_changes (payload, created_at) VALUES ($1, $2) RETURNING xid::text`,
+		[]byte("old"), stale).Scan(&staleXid); err != nil {
 		t.Fatalf("inserting aged row failed: %v", err)
 	}
 	// An aged stray in the DEFAULT partition (no hourly partition covers a
@@ -338,12 +338,12 @@ func TestWorkerChangesPartitionRetention(t *testing.T) {
 	if remaining != 1 {
 		t.Errorf("%d rows remain, want 1 (the fresh row; aged partition row and default stray gone)", remaining)
 	}
-	var trim int64
-	if err := s.pool.QueryRow(ctx, `SELECT seq FROM worker_changes_trim`).Scan(&trim); err != nil {
+	var trim bool
+	if err := s.pool.QueryRow(ctx, `SELECT (SELECT xid FROM worker_changes_trim) >= $1::xid8`, staleXid).Scan(&trim); err != nil {
 		t.Fatalf("reading trim mark failed: %v", err)
 	}
-	if trim < staleSeq {
-		t.Errorf("trim mark %d does not cover dropped partition's seq %d", trim, staleSeq)
+	if !trim {
+		t.Errorf("trim mark does not cover dropped partition's xid %s", staleXid)
 	}
 }
 
@@ -396,95 +396,37 @@ func TestChangeFeedMaintenance_SingleMaintainer(t *testing.T) {
 	}
 }
 
-// TestWatchWorkers_TrimMarkUsesCursorOrdering is the regression test for
-// the trim mark and the cursor disagreeing on ordering. The cursor
-// advances in (xid, seq) delivery order, in which seq can regress: here
-// the watcher consumes (xid_a, s3) while (xid_b, s2) — later xid, earlier
-// seq — is discarded unconsumed. A seq-only trim mark (s2) compared
-// against cursorSeq (s3) would stay silent and the event would be lost;
-// the (xid, seq) tuple mark must close the watch for resync.
-func TestWatchWorkers_TrimMarkUsesCursorOrdering(t *testing.T) {
+// TestWorkerEvents_OneRowPerTransaction pins the invariant the xid-only
+// watch cursor rests on: writeAndAppendChange appends exactly one feed row
+// per transaction, so xids are distinct across the feed and a poll batch
+// can never split a same-xid group.
+func TestWorkerEvents_OneRowPerTransaction(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 
-	watch, err := s.WatchWorkers(ctx)
-	if err != nil {
-		t.Fatalf("WatchWorkers failed: %v", err)
+	worker := &ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "pod"}
+	if err := s.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
 	}
-	defer watch.Close()
-
-	mkPayload := func(pod string) []byte {
-		payload, err := marshalWorkerEvent(store.WorkerEventCreated,
-			&ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: pod})
+	for i := 0; i < 10; i++ {
+		stored, err := s.GetWorker(ctx, "ns", "pool", "pod")
 		if err != nil {
-			t.Fatalf("marshaling event for %q: %v", pod, err)
+			t.Fatalf("GetWorker failed: %v", err)
 		}
-		return payload
-	}
-
-	// txA takes its xid first (xid_a)...
-	txA, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("Begin txA failed: %v", err)
-	}
-	defer txA.Rollback(ctx) //nolint:errcheck // no-op once committed
-	if _, err := txA.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
-		t.Fatalf("assigning txA xid failed: %v", err)
-	}
-	// ...then txB (xid_b > xid_a) takes the earlier feed seq (s2)...
-	txB, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("Begin txB failed: %v", err)
-	}
-	defer txB.Rollback(ctx) //nolint:errcheck // no-op once committed
-	var bXid string
-	var bSeq int64
-	if err := txB.QueryRow(ctx, `INSERT INTO worker_changes (payload) VALUES ($1) RETURNING xid::text, seq`, mkPayload("discarded")).Scan(&bXid, &bSeq); err != nil {
-		t.Fatalf("txB feed insert failed: %v", err)
-	}
-	// ...and txA takes the later seq (s3) and commits.
-	if _, err := txA.Exec(ctx, `INSERT INTO worker_changes (payload) VALUES ($1)`, mkPayload("consumed")); err != nil {
-		t.Fatalf("txA feed insert failed: %v", err)
-	}
-	if err := txA.Commit(ctx); err != nil {
-		t.Fatalf("txA Commit failed: %v", err)
-	}
-
-	// txA's row clears the fence while txB is still open; the cursor
-	// advances to (xid_a, s3) — cursorSeq now EXCEEDS txB's s2.
-	select {
-	case event := <-watch.Events:
-		if got := event.Worker.GetWorkerPod(); got != "consumed" {
-			t.Fatalf("delivered %q, want %q", got, "consumed")
+		if err := s.UpdateWorker(ctx, stored, stored.GetVersion()); err != nil {
+			t.Fatalf("UpdateWorker %d failed: %v", i, err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for txA's event")
+	}
+	if err := s.DeleteWorker(ctx, "ns", "pool", "pod"); err != nil {
+		t.Fatalf("DeleteWorker failed: %v", err)
 	}
 
-	// txB discards its own row and records the trim mark atomically —
-	// a committed-but-never-consumable event, as if retention took it.
-	if _, err := txB.Exec(ctx, `DELETE FROM worker_changes WHERE seq = $1`, bSeq); err != nil {
-		t.Fatalf("txB discard failed: %v", err)
+	var total, distinct int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*), count(DISTINCT xid) FROM worker_changes`).Scan(&total, &distinct); err != nil {
+		t.Fatalf("counting feed rows failed: %v", err)
 	}
-	if _, err := txB.Exec(ctx, `
-		INSERT INTO worker_changes_trim (xid, seq) VALUES ($1::xid8, $2)
-		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid, seq = EXCLUDED.seq
-		WHERE (EXCLUDED.xid, EXCLUDED.seq) > (worker_changes_trim.xid, worker_changes_trim.seq)`, bXid, bSeq); err != nil {
-		t.Fatalf("txB trim mark failed: %v", err)
-	}
-	if err := txB.Commit(ctx); err != nil {
-		t.Fatalf("txB Commit failed: %v", err)
-	}
-
-	select {
-	case event, ok := <-watch.Events:
-		if ok {
-			t.Fatalf("unexpected event %+v; want the channel closed for resync", event)
-		}
-		// Expected: (xid_b, s2) > (xid_a, s3) tuple-wise, so the watch
-		// closed — a seq-only comparison (s2 < s3) would have missed it.
-	case <-time.After(5 * time.Second):
-		t.Fatal("watch did not close: the trim mark comparison missed a discarded row whose seq is below the cursor")
+	if total == 0 || total != distinct {
+		t.Errorf("feed has %d rows but %d distinct xids; the one-row-per-transaction invariant is broken", total, distinct)
 	}
 }
 
@@ -578,7 +520,7 @@ func TestPollQueryPlanStaysOnIndex(t *testing.T) {
 		t.Fatalf("ANALYZE failed: %v", err)
 	}
 
-	rows, err := s.pool.Query(ctx, "EXPLAIN "+pollWorkerChangesSQL, "100", 0, changeFeedBatch)
+	rows, err := s.pool.Query(ctx, "EXPLAIN "+pollWorkerChangesSQL, "100", changeFeedBatch)
 	if err != nil {
 		t.Fatalf("EXPLAIN failed: %v", err)
 	}
@@ -728,9 +670,9 @@ func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
 		t.Fatal("timed out waiting for the first event")
 	}
 
-	// Atomically append three events and trim all but the newest — the
-	// watcher never gets a chance to consume the first two, exactly as if
-	// retention trimmed rows a lagging watcher had not reached.
+	// Atomically append three events and trim them away unconsumed —
+	// the watcher never gets a chance to see them, exactly as if
+	// retention took rows a lagging watcher had not reached.
 	payload, err := marshalWorkerEvent(store.WorkerEventUpdated, worker)
 	if err != nil {
 		t.Fatalf("marshaling event: %v", err)
@@ -744,16 +686,18 @@ func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
 		t.Fatalf("feed inserts failed: %v", err)
 	}
 	// Mirrors trimWorkerChangesDefault's shape: the mark is the deleted
-	// set's greatest (xid, seq).
+	// set's greatest xid. (The three rows above share one transaction —
+	// fine here: this test only needs the recorded mark to land past the
+	// watcher's cursor, and deletes everything the watcher has not seen.)
 	if _, err := tx.Exec(ctx, `
 		WITH doomed AS (
-			DELETE FROM worker_changes WHERE seq < (SELECT max(seq) FROM worker_changes)
-			RETURNING xid, seq
+			DELETE FROM worker_changes WHERE xid > (SELECT COALESCE((SELECT xid FROM worker_changes_trim), '0'::xid8))
+			RETURNING xid
 		)
-		INSERT INTO worker_changes_trim (xid, seq)
-		SELECT xid, seq FROM doomed ORDER BY xid DESC, seq DESC LIMIT 1
-		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid, seq = EXCLUDED.seq
-		WHERE (EXCLUDED.xid, EXCLUDED.seq) > (worker_changes_trim.xid, worker_changes_trim.seq)`); err != nil {
+		INSERT INTO worker_changes_trim (xid)
+		SELECT xid FROM doomed ORDER BY xid DESC LIMIT 1
+		ON CONFLICT (id) DO UPDATE SET xid = EXCLUDED.xid
+		WHERE EXCLUDED.xid > worker_changes_trim.xid`); err != nil {
 		t.Fatalf("trim failed: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
