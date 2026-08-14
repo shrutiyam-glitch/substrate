@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS workers (
 -- Partitioned hourly by created_at so retention is a partition DROP — a
 -- metadata operation with no row deletes, dead tuples, or vacuum debt —
 -- instead of bulk DELETEs whose I/O competes with foreground traffic. The
--- janitor (changeFeedJanitor) creates upcoming partitions and drops expired
+-- maintenance loop (changeFeedMaintenance) creates upcoming partitions and drops expired
 -- ones; the DEFAULT partition only receives writes if partition creation
 -- ever stalls, and is trimmed row-wise as a fallback.
 --

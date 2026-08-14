@@ -291,7 +291,7 @@ func TestWatchWorkers_OutOfOrderCommitNotSkipped(t *testing.T) {
 	}
 }
 
-// TestWorkerChangesPartitionRetention verifies the janitor's partition-based
+// TestWorkerChangesPartitionRetention verifies partition-based
 // retention: an hourly partition wholly past changeFeedRetentionAge is
 // dropped (with its greatest seq recorded in worker_changes_trim), fresh
 // rows survive, and aged strays in the DEFAULT partition are trimmed by the
@@ -448,7 +448,7 @@ func TestWatchWorkers_ClosesOnPersistentPollFailure(t *testing.T) {
 
 // TestWatchWorkers_ClosesWhenTrimmedPastCursor verifies the retention
 // escape hatch: when rows a watcher has not consumed are deleted out from
-// under it (a janitor trim on a badly lagging watcher), the watcher must
+// under it (a retention trim on a badly lagging watcher), the watcher must
 // close its channel — the signal consumers treat as resync-and-relist —
 // rather than silently skip the gap.
 func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
@@ -474,7 +474,7 @@ func TestWatchWorkers_ClosesWhenTrimmedPastCursor(t *testing.T) {
 
 	// Atomically append three events and trim all but the newest — the
 	// watcher never gets a chance to consume the first two, exactly as if
-	// the janitor trimmed rows a lagging watcher had not reached.
+	// retention trimmed rows a lagging watcher had not reached.
 	payload, err := marshalWorkerEvent(store.WorkerEventUpdated, worker)
 	if err != nil {
 		t.Fatalf("marshaling event: %v", err)

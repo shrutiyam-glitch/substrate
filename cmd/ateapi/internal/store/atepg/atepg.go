@@ -47,7 +47,7 @@ import (
 type Persistence struct {
 	pool        *pgxpool.Pool
 	lockTTL     time.Duration
-	stopJanitor context.CancelFunc
+	stopMaintenance context.CancelFunc
 }
 
 var _ store.Interface = (*Persistence)(nil)
@@ -78,24 +78,24 @@ func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, erro
 	if err := applySchema(ctx, pool); err != nil {
 		return nil, err
 	}
-	janitorCtx, stopJanitor := context.WithCancel(context.Background())
-	p := &Persistence{pool: pool, lockTTL: defaultLockTTL, stopJanitor: stopJanitor}
+	maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
+	p := &Persistence{pool: pool, lockTTL: defaultLockTTL, stopMaintenance: stopMaintenance}
 	// Cover the current and next hour before accepting writes; from then on
-	// the janitor keeps partitions ahead of the clock (and the DEFAULT
+	// the maintenance loop keeps partitions ahead of the clock (and the DEFAULT
 	// partition catches writes if it ever falls behind).
 	now := time.Now().UTC()
 	if err := p.createWorkerChangesPartitions(ctx, now, now.Add(time.Hour)); err != nil {
-		stopJanitor()
+		stopMaintenance()
 		return nil, err
 	}
-	go p.changeFeedJanitor(janitorCtx)
+	go p.changeFeedMaintenance(maintenanceCtx)
 	return p, nil
 }
 
-// Close stops background maintenance (the change-feed janitor). It does not
+// Close stops background maintenance (the change-feed maintenance loop). It does not
 // close the pool, which the caller owns.
 func (p *Persistence) Close() {
-	p.stopJanitor()
+	p.stopMaintenance()
 }
 
 // querier is satisfied by both *pgxpool.Pool and pgx.Tx, letting read helpers
@@ -1070,23 +1070,28 @@ func (p *Persistence) ListWorkers(ctx context.Context, pageSize int32, pageToken
 	return result, nextToken, nil
 }
 
-// changeFeedPollInterval bounds worker-event delivery latency (watch target
-// is <=1s). changeFeedBatch caps rows fetched per poll; a burst beyond it
-// carries over to the next poll (events are delayed, never dropped).
-// changeFeedRetentionAge is the minimum time the janitor keeps feed rows;
-// it must comfortably exceed worst-case watcher lag, because a watcher that
-// falls behind it closes for resync (see WatchWorkers). Retention operates
-// on whole hourly partitions, so a row actually lives between
-// changeFeedRetentionAge and changeFeedRetentionAge + 1h.
-// changeFeedJanitorInterval paces partition maintenance;
-// changeFeedJanitorBatch bounds the row-wise fallback trim of the DEFAULT
-// partition.
+
 const (
+	// changeFeedPollInterval bounds worker-event delivery latency (watch target is <=1s).
 	changeFeedPollInterval    = 100 * time.Millisecond
+
+	// changeFeedBatch caps rows fetched per poll; a burst beyond it carries over to the 
+	// next poll (events are delayed, never dropped).
 	changeFeedBatch           = 1024
+
+	// changeFeedRetentionAge is the minimum time retention keeps feed rows; 
+	// it must comfortably exceed worst-case watcher lag, because a watcher that falls 
+	// behind it closes for resync (see WatchWorkers). 
+	// Retention operates on whole hourly partitions, so a row actually lives between 
+	// changeFeedRetentionAge and changeFeedRetentionAge + 1h.
 	changeFeedRetentionAge    = 15 * time.Minute
-	changeFeedJanitorInterval = time.Minute
-	changeFeedJanitorBatch    = 10_000
+
+	// changeFeedMaintenanceInterval paces partition maintenance;
+	changeFeedMaintenanceInterval = time.Minute
+
+	// changeFeedDefaultTrimBatch bounds the row-wise fallback trim of the DEFAULT partition.
+	changeFeedDefaultTrimBatch    = 10_000
+
 	// changeFeedMaxPollFailures is how many consecutive failed polls
 	// (~5s at the poll interval) a watch rides out before treating the
 	// outage as a possible database restart — which truncates the
@@ -1094,18 +1099,18 @@ const (
 	changeFeedMaxPollFailures = 50
 )
 
-// changeFeedJanitor maintains worker_changes partitions on a fixed timer,
+// changeFeedMaintenance maintains worker_changes partitions on a fixed timer,
 // for the life of the Persistence. Retention is deliberately decoupled from
 // watcher cursors: keying it to any one watcher's position would let a fast
-// watcher discard rows a slower one has not consumed, and a janitor living
+// watcher discard rows a slower one has not consumed, and a maintenance loop living
 // inside a watcher goroutine never runs on a process holding no watch,
 // letting the table grow without bound (the write path always appends).
 // Retention is a partition DROP — a metadata operation — so reclaiming even
 // a large backlog produces no delete/WAL/vacuum load competing with
-// foreground traffic (an earlier row-DELETE janitor draining a backlog
+// foreground traffic (an earlier row-DELETE retention pass draining a backlog
 // mid-traffic degraded worker-update p99 by an order of magnitude).
-func (p *Persistence) changeFeedJanitor(ctx context.Context) {
-	ticker := time.NewTicker(changeFeedJanitorInterval)
+func (p *Persistence) changeFeedMaintenance(ctx context.Context) {
+	ticker := time.NewTicker(changeFeedMaintenanceInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1114,12 +1119,12 @@ func (p *Persistence) changeFeedJanitor(ctx context.Context) {
 		case <-ticker.C:
 		}
 		if err := p.maintainWorkerChangesPartitions(ctx); err != nil && ctx.Err() == nil {
-			slog.WarnContext(ctx, "worker change feed janitor failed", slog.Any("err", err))
+			slog.WarnContext(ctx, "worker change feed maintenance failed", slog.Any("err", err))
 		}
 	}
 }
 
-// maintainWorkerChangesPartitions is one janitor pass: make sure the
+// maintainWorkerChangesPartitions is one maintenance pass: make sure the
 // current and next hourly partitions exist, drop partitions wholly past
 // retention, and trim any strays that landed in the DEFAULT partition.
 // Every step is idempotent, so concurrent replicas racing a pass is
@@ -1137,7 +1142,7 @@ func (p *Persistence) maintainWorkerChangesPartitions(ctx context.Context) error
 		if err != nil {
 			return err
 		}
-		if n < changeFeedJanitorBatch {
+		if n < changeFeedDefaultTrimBatch {
 			return nil
 		}
 	}
@@ -1218,7 +1223,7 @@ func (p *Persistence) dropExpiredWorkerChangesPartitions(ctx context.Context, no
 		}
 		start, err := time.Parse("2006010215", suffix)
 		if err != nil {
-			continue // not a partition this janitor manages
+			continue // not a partition this maintenance loop manages
 		}
 		if now.Sub(start.Add(time.Hour)) < changeFeedRetentionAge {
 			continue
@@ -1269,13 +1274,13 @@ func (p *Persistence) dropWorkerChangesPartition(ctx context.Context, name strin
 func (p *Persistence) trimWorkerChangesDefault(ctx context.Context) (int64, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("beginning feed janitor transaction: %w", err)
+		return 0, fmt.Errorf("beginning feed maintenance transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
 	var elected bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('agent-substrate-atepg-change-feed-janitor'))`).Scan(&elected); err != nil {
-		return 0, fmt.Errorf("electing feed janitor: %w", err)
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('agent-substrate-atepg-change-feed-maintenance'))`).Scan(&elected); err != nil {
+		return 0, fmt.Errorf("electing feed maintenance: %w", err)
 	}
 	if !elected {
 		return 0, nil
@@ -1294,11 +1299,11 @@ func (p *Persistence) trimWorkerChangesDefault(ctx context.Context) (int64, erro
 			ON CONFLICT (id) DO UPDATE SET seq = GREATEST(worker_changes_trim.seq, EXCLUDED.seq)
 		)
 		SELECT count(*) FROM doomed`,
-		changeFeedRetentionAge.Seconds(), changeFeedJanitorBatch).Scan(&n); err != nil {
+		changeFeedRetentionAge.Seconds(), changeFeedDefaultTrimBatch).Scan(&n); err != nil {
 		return 0, fmt.Errorf("trimming feed default partition: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("committing feed janitor transaction: %w", err)
+		return 0, fmt.Errorf("committing feed maintenance transaction: %w", err)
 	}
 	return n, nil
 }
@@ -1319,7 +1324,7 @@ func (p *Persistence) trimWorkerChangesDefault(ctx context.Context) (int64, erro
 // across concurrent transactions; consumers reconcile by worker version
 // (see workercache.applyEvent).
 //
-// A watcher that lags the janitor's age-based retention
+// A watcher that lags age-based retention
 // (changeFeedRetentionAge) may have had unconsumed rows trimmed; rather
 // than skip them silently, it closes the event channel, which consumers
 // already treat as a resync-and-relist signal (see workercache.watchEvents).
@@ -1423,7 +1428,7 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 				rows.Close()
 				drained = len(batch) < changeFeedBatch
 
-				// Retention safety: if the janitor's recorded trim high-water
+				// Retention safety: if retention's recorded trim high-water
 				// mark is ahead of everything this watcher has seen, a row it
 				// never consumed was deleted. Close before delivering anything
 				// past the gap; consumers resync with a full relist.
