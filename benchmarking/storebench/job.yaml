@@ -39,6 +39,62 @@ spec:
         prometheus.io/port: "9090"
     spec:
       restartPolicy: Never
+      nodeName: gke-agent-substrate-substrate-node-po-918b932a-bnfp
+      # Tunnel authorization for the Cloud SQL Auth Proxy sidecar below: this
+      # KSA is Workload-Identity-bound to the GSA holding roles/cloudsql.client
+      # (see tools/setup-gcp cloudsql / cloud-sql.md). Remove together with the
+      # sidecar for direct-connection runs.
+      serviceAccountName: ate-api-server
+      # Native sidecar (initContainer + restartPolicy Always, k8s 1.29+): the
+      # proxy starts before storebench (gated on /startup) and is terminated
+      # automatically when storebench finishes, so the Job still completes.
+      # It owns transport security to the instance; storebench connects to
+      # 127.0.0.1:5432 in plaintext that never leaves the pod. Pair with the
+      # dsn-proxy secret key below; for a DIRECT-path run, drop this container,
+      # serviceAccountName above, and switch the secret key back to `dsn`.
+      initContainers:
+      - name: cloud-sql-proxy
+        image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.25.2
+        restartPolicy: Always
+        args:
+        # Instance connection name (project:region:instance) — edit per env.
+        - "shrutiyam-gke-dev:us-central1:atepg-bench"
+        env:
+        - name: CSQL_PROXY_PORT
+          value: "5432"
+        - name: CSQL_PROXY_PRIVATE_IP
+          value: "true"
+        - name: CSQL_PROXY_HEALTH_CHECK
+          value: "true"
+        - name: CSQL_PROXY_HTTP_ADDRESS
+          value: "0.0.0.0"
+        # 9801: storebench's own metrics listener owns 9090.
+        - name: CSQL_PROXY_HTTP_PORT
+          value: "9801"
+        - name: CSQL_PROXY_STRUCTURED_LOGS
+          value: "true"
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+        # Benchmark-sized, not control-plane-sized: the proxy encrypts every
+        # byte of bench traffic, so starve it and it becomes the bottleneck
+        # under measurement.
+        resources:
+          requests:
+            cpu: "1"
+            memory: 256Mi
+        startupProbe:
+          httpGet:
+            path: /startup
+            port: 9801
+          periodSeconds: 1
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /liveness
+            port: 9801
+          initialDelaySeconds: 10
+          periodSeconds: 10
       containers:
       - name: storebench
         image: ko://github.com/agent-substrate/substrate/cmd/ateapi/storebench
@@ -74,7 +130,10 @@ spec:
           valueFrom:
             secretKeyRef:
               name: storebench-dsn-v2
-              key: dsn
+              # dsn-proxy: loopback DSN through the cloud-sql-proxy sidecar
+              # (host=127.0.0.1, sslmode=disable). Use `dsn` (direct instance
+              # IP, sslmode=require) for direct-path runs without the sidecar.
+              key: dsn-proxy
               optional: true
         volumeMounts:
         - name: servicedns
