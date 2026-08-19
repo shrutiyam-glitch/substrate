@@ -78,6 +78,8 @@ var (
 	actorIDJWTPoolFile   = pflag.String("actor-id-jwt-pool", "", "The file that contains the serialized JWT authority pool for signing actor JWTs")
 	egressGatewayAddress = pflag.String("egress-gateway-address", "", "Address of the egress PEP. Empty disables tunneled egress.")
 
+	ateletSimulatorAddress = pflag.String("atelet-simulator-address", "", "Route all worker runtime RPCs to this static atelet endpoint instead of per-pod discovery. BENCHMARK-ONLY (see docs/dev/fake-lifecycle-testing.md); empty uses production Kubernetes atelet discovery.")
+
 	actorIDCAPoolFile      = pflag.String("actor-id-ca-pool", "", "The file that contains the CA pool for signing actor JWTs")
 	podIdentityCACerts     = pflag.String("pod-identity-ca-certs", "", "The file that contains the pod-identity CA bundle, used both for verifying client certificates presented to the gRPC server and for verifying atelet serving certificates when dialing atelet. If empty, client-cert verification is disabled and atelet dials will fail.")
 	ateletClientCredBundle = pflag.String("atelet-client-cred-bundle", "", "Credential bundle presented as the client certificate when dialing atelet.")
@@ -192,7 +194,15 @@ func main() {
 	}
 
 	volPlugins := make(map[string]volume.VolumePluginControlPlane)
-	ateletDialer := controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer(), *ateletClientCredBundle, *podIdentityCACerts)
+	var ateletDialer controlapi.WorkerRuntimeDialer = controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer(), *ateletClientCredBundle, *podIdentityCACerts)
+	if *ateletSimulatorAddress != "" {
+		slog.WarnContext(ctx, "BENCHMARK MODE: routing all atelet RPCs to a simulator", slog.String("address", *ateletSimulatorAddress))
+		staticDialer, err := controlapi.NewStaticAteletDialer(*ateletSimulatorAddress)
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to create static atelet dialer", err)
+		}
+		ateletDialer = staticDialer
+	}
 	sm := controlapi.NewService(persistence, workerCache, actorTemplateLister, workerPoolLister, sandboxConfigLister, csiDriverConfigLister, storageClassLister, ateletDialer, instruments, *egressGatewayAddress, volPlugins)
 
 	actorIdentitySrv := actoridentity.New(actorIdentityJWTIssuer, *actorIDJWTPoolFile, *actorIDCAPoolFile, persistence, workerCache)

@@ -1,0 +1,95 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Fake atelet for control-plane benchmarking: implements AteomHerder
+# (Run/Checkpoint/Restore) with immediate success. Deploy with:
+#   hack/run-tool.sh ko apply -f benchmarking/atelet-simulator/manifests.yaml
+# then point ateapi at it (see docs/dev/fake-lifecycle-testing.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atelet-simulator
+  namespace: ate-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atelet-simulator
+  template:
+    metadata:
+      labels:
+        app: atelet-simulator
+    spec:
+      # atelet's ServiceAccount: MintCert callbacks authenticate as atelet by
+      # SPIFFE ID, which the podidentity signer derives from the pod's SA.
+      serviceAccountName: atelet
+      # Pinned: seeded workers carry this node name (MintCert authorizes only
+      # workers on the caller's node); an unpinned pod invalidates the fleet
+      # on every reschedule.
+      nodeSelector:
+        kubernetes.io/hostname: gke-agent-substrate-substrate-node-po-918b932a-bnfp
+      containers:
+      - name: simulator
+        image: ko://github.com/agent-substrate/substrate/cmd/benchmarking/atelet-simulator
+        args:
+        - --listen-addr=:9090
+        - --response-delay=1ms
+        - --mint-target=dns:///api.ate-system.svc:443
+        ports:
+        - name: grpc
+          containerPort: 9090
+        resources:
+          requests:
+            cpu: 500m
+            memory: 256Mi
+        volumeMounts:
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+          readOnly: true
+        - name: servicedns
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+      volumes:
+      # Client identity for MintCert (atelet SPIFFE ID + PodIdentity
+      # extension carrying this pod's node name).
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              credentialBundlePath: credential-bundle.pem
+              keyType: ECDSAP256
+              signerName: podidentity.podcert.ate.dev/identity
+      # Trust bundle for verifying ateapi's serving certificate.
+      - name: servicedns
+        projected:
+          sources:
+          - clusterTrustBundle:
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+              signerName: servicedns.podcert.ate.dev/identity
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atelet-simulator
+  namespace: ate-system
+spec:
+  selector:
+    app: atelet-simulator
+  ports:
+  - name: grpc
+    port: 9090
+    targetPort: 9090

@@ -1,0 +1,193 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Open-loop store benchmark Job (cmd/ateapi/storebench). See README.md in
+# this directory for setup and usage; edit the args below per run (backend,
+# rps, dataset rung, mix).
+#
+# For --backend=postgres against Cloud SQL, first create the DSN secret:
+#   kubectl create secret generic storebench-dsn -n ate-system \
+#     --from-literal=dsn="postgresql://postgres:<PW>@10.25.0.3:5432/atepg?sslmode=require"
+#
+# Deploy with:  hack/run-tool.sh ko apply -f benchmarking/storebench/job.yaml
+# Results:      kubectl logs -n ate-system job/storebench -f
+# Re-run:       kubectl delete job -n ate-system storebench, edit, re-apply.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: storebench
+  namespace: ate-system
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: storebench
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      restartPolicy: Never
+      nodeName: gke-agent-substrate-substrate-node-po-918b932a-bnfp
+      # Tunnel authorization for the Cloud SQL Auth Proxy sidecar below: this
+      # KSA is Workload-Identity-bound to the GSA holding roles/cloudsql.client
+      # (see tools/setup-gcp cloudsql / cloud-sql.md). Remove together with the
+      # sidecar for direct-connection runs.
+      serviceAccountName: ate-api-server
+      # Native sidecar (initContainer + restartPolicy Always, k8s 1.29+): the
+      # proxy starts before storebench (gated on /startup) and is terminated
+      # automatically when storebench finishes, so the Job still completes.
+      # It owns transport security to the instance; storebench connects to
+      # 127.0.0.1:5432 in plaintext that never leaves the pod. Pair with the
+      # dsn-proxy secret key below; for a DIRECT-path run, drop this container,
+      # serviceAccountName above, and switch the secret key back to `dsn`.
+      initContainers:
+      - name: cloud-sql-proxy
+        image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.25.2
+        restartPolicy: Always
+        args:
+        # Instance connection name (project:region:instance) — edit per env.
+        - "shrutiyam-gke-dev:us-central1:atepg-bench"
+        env:
+        - name: CSQL_PROXY_PORT
+          value: "5432"
+        - name: CSQL_PROXY_PRIVATE_IP
+          value: "true"
+        - name: CSQL_PROXY_HEALTH_CHECK
+          value: "true"
+        - name: CSQL_PROXY_HTTP_ADDRESS
+          value: "0.0.0.0"
+        # 9801: storebench's own metrics listener owns 9090.
+        - name: CSQL_PROXY_HTTP_PORT
+          value: "9801"
+        - name: CSQL_PROXY_STRUCTURED_LOGS
+          value: "true"
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+        # Benchmark-sized, not control-plane-sized: the proxy encrypts every
+        # byte of bench traffic, so starve it and it becomes the bottleneck
+        # under measurement.
+        resources:
+          requests:
+            cpu: "1"
+            memory: 256Mi
+        startupProbe:
+          httpGet:
+            path: /startup
+            port: 9801
+          periodSeconds: 1
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /liveness
+            port: 9801
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      containers:
+      - name: storebench
+        image: ko://github.com/agent-substrate/substrate/cmd/ateapi/storebench
+        args:
+        # --- pick the backend under test ---
+        - --backend=postgres
+        - --load-only=true
+        - --actors=200
+        - --workers=1000
+        - --atespaces=2
+        - --worker-pools=1
+        - --seed-worker-namespace=benchmark-workloads
+        - --seed-pool-prefix=benchmark-ateom
+        - --seed-template-namespace=benchmark-workloads
+        - --seed-template-name=sleep
+        - --seed-actor-prefix=lcactor-
+        - --seed-worker-prefix=lcworker-
+        - --seed-worker-sandbox-class=gvisor
+        - --seed-worker-active=true
+        - --seed-worker-labels=workload=benchmark-ateom
+        - --seed-worker-node-name=gke-agent-substrate-substrate-node-po-918b932a-bnfp
+        - --json-out=/dev/termination-log
+        ports:
+        - name: metrics
+          containerPort: 9090
+        env:
+        - name: STOREBENCH_POSTGRES_DSN
+          valueFrom:
+            secretKeyRef:
+              name: storebench-dsn-v2
+              # dsn-proxy: loopback DSN through the cloud-sql-proxy sidecar
+              # (host=127.0.0.1, sslmode=disable). Use `dsn` (direct instance
+              # IP, sslmode=require) for direct-path runs without the sidecar.
+              key: dsn-proxy
+              optional: true
+        volumeMounts:
+        - name: servicedns
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+          readOnly: true
+        resources:
+          requests:
+            cpu: "2"
+            memory: "2Gi"
+          limits:
+            cpu: "4"
+            memory: "4Gi"
+      volumes:
+      # podidentity: the client identity Valkey verifies. servicedns: ONLY
+      # the trust bundle (verifies Valkey's serving cert) — no podCertificate
+      # source, because the servicedns signer only issues serving certs to
+      # pods backing a Service, and this Job serves nothing; requesting one
+      # would leave the pod stuck in ContainerCreating forever.
+      # Both volumes are unused for --backend=postgres.
+      - name: servicedns
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: podidentity.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+---
+# Google Managed Prometheus collection: makes storebench metrics visible in
+# Cloud Monitoring / Metrics Explorer (as prometheus.googleapis.com/
+# storebench_*) with months of retention — unlike the in-cluster benchmarking
+# Prometheus, whose TSDB is ephemeral. Requires GMP managed collection on the
+# cluster (gmp-system namespace present).
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: storebench
+  namespace: ate-system
+spec:
+  selector:
+    matchLabels:
+      app: storebench
+  endpoints:
+  - port: metrics
+    interval: 15s

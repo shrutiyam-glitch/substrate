@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"os"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
@@ -339,6 +340,15 @@ func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, namespace, po
 	return s.persistence.UpdateWorker(ctx, worker, worker.GetVersion())
 }
 
+// benchmarkKeepSyntheticWorkers disables dead-worker cleanup so synthetic
+// fleets (store rows with no pods, seeded for fake-lifecycle benchmarking)
+// survive ateapi. The stored-worker sweep otherwise reconciles every podless
+// row as dead — releasing its actor and deleting it (~7k rows/min observed).
+// BENCHMARK-ONLY: set ATE_BENCH_KEEP_SYNTHETIC_WORKERS=1 alongside
+// --atelet-simulator-address; never in production.
+// See docs/dev/fake-lifecycle-testing.md.
+var benchmarkKeepSyntheticWorkers = os.Getenv("ATE_BENCH_KEEP_SYNTHETIC_WORKERS") == "1"
+
 // reconcileDeadWorker cleans up a worker whose pod is gone. It releases the
 // bound actor first and only deletes the worker record if that succeeds:
 // deleting the record is what erases the actor->pod pointer, so on a release
@@ -346,6 +356,9 @@ func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, namespace, po
 // later reconcile can retry. Returns nil once the actor is released and the
 // worker record deleted.
 func (s *WorkerPoolSyncer) reconcileDeadWorker(ctx context.Context, namespace, pool, podName string) error {
+	if benchmarkKeepSyntheticWorkers {
+		return nil
+	}
 	if err := s.releaseActorOnDeadWorker(ctx, namespace, pool, podName); err != nil {
 		return err
 	}

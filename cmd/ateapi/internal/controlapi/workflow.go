@@ -71,7 +71,7 @@ type ActorWorkflow struct {
 	store                actorWorkflowStore
 	workerCache          *workercache.Cache
 	scheduler            scheduling.Scheduler
-	dialer               *AteletDialer
+	dialer               WorkerRuntimeDialer
 	actorTemplateLister  listersv1alpha1.ActorTemplateLister
 	workerPoolLister     listersv1alpha1.WorkerPoolLister
 	sandboxConfigLister  listersv1alpha1.SandboxConfigLister
@@ -85,7 +85,7 @@ type ActorWorkflow struct {
 func NewActorWorkflow(
 	store actorWorkflowStore,
 	workerCache *workercache.Cache,
-	dialer *AteletDialer,
+	dialer WorkerRuntimeDialer,
 	actorTemplateLister listersv1alpha1.ActorTemplateLister,
 	workerPoolLister listersv1alpha1.WorkerPoolLister,
 	sandboxConfigLister listersv1alpha1.SandboxConfigLister,
