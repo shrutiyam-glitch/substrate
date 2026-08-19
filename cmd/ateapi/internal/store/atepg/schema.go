@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS leases (
     token       text NOT NULL,
     expires_at  timestamptz NOT NULL
 );
+
+-- Publication feeding the worker change watch (logicalrepl.go). Scoped to
+-- the workers table so pgoutput emits nothing for other tables' traffic.
+-- CREATE PUBLICATION has no IF NOT EXISTS; the advisory lock in applySchema
+-- serializes replicas, so a bare existence check suffices.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'ate_workers_pub') THEN
+        CREATE PUBLICATION ate_workers_pub FOR TABLE workers;
+    END IF;
+END
+$$;
 `
 
 // applySchema idempotently creates atepg's tables.

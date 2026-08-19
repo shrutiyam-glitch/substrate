@@ -20,6 +20,10 @@ metadata:
 data:
   postgresql.conf: |
     listen_addresses = '*'
+    # The worker change watch consumes logical replication (one temporary
+    # slot per ateapi replica; see atepg/logicalrepl.go). Default
+    # max_wal_senders/max_replication_slots (10) cover the replica count.
+    wal_level = logical
     ssl = on
     ssl_cert_file = '/run/tls/credential-bundle.pem'
     ssl_key_file = '/run/tls/credential-bundle.pem'

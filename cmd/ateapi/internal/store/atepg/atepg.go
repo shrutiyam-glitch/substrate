@@ -23,7 +23,6 @@ package atepg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,7 +35,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -1049,69 +1047,19 @@ func (p *Persistence) DeleteActorSnapshotTag(ctx context.Context, atespace, name
 
 // --- Workers ---
 
-const (
-	// workerChangeChannel is the fixed LISTEN/NOTIFY channel for worker changes.
-	workerChangeChannel = "worker_changes"
-	// maxNotifyPayloadBytes reflects PostgreSQL's NOTIFY payload size limit.
-	// Writes fail rather than silently omit a notification if exceeded.
-	maxNotifyPayloadBytes = 8000
-)
-
-type workerEventEnvelope struct {
-	Type   int    `json:"t"`
-	Worker string `json:"w"` // protojson-encoded Worker
-}
-
-func marshalWorkerEvent(eventType store.WorkerEventType, worker *ateapipb.Worker) ([]byte, error) {
-	workerJSON, err := protojson.Marshal(worker)
-	if err != nil {
-		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
-	}
-	msg, err := json.Marshal(workerEventEnvelope{Type: int(eventType), Worker: string(workerJSON)})
-	if err != nil {
-		return nil, fmt.Errorf("in json.Marshal: %w", err)
-	}
-	return msg, nil
-}
-
-func unmarshalWorkerEvent(payload string) (store.WorkerEvent, error) {
-	var env workerEventEnvelope
-	if err := json.Unmarshal([]byte(payload), &env); err != nil {
-		return store.WorkerEvent{}, fmt.Errorf("in json.Unmarshal: %w", err)
-	}
-	worker := &ateapipb.Worker{}
-	if err := protojson.Unmarshal([]byte(env.Worker), worker); err != nil {
-		return store.WorkerEvent{}, fmt.Errorf("in protojson.Unmarshal: %w", err)
-	}
-	return store.WorkerEvent{Type: store.WorkerEventType(env.Type), Worker: worker}, nil
-}
-
-// writeAndNotify runs fn inside a transaction, then--only if fn reports a
-// change worth notifying--calls pg_notify in the same transaction so
-// delivery happens if and only if the transaction commits.
-func (p *Persistence) writeAndNotify(ctx context.Context, eventType store.WorkerEventType, worker *ateapipb.Worker, fn func(ctx context.Context, tx pgx.Tx) (notify bool, err error)) error {
+// writeWorker runs fn inside a transaction. Worker change events are not
+// published here: they are derived from the committed row change itself by
+// logical decoding (see logicalrepl.go), so delivery-iff-commit is inherent
+// and the write path pays no notify or outbox step.
+func (p *Persistence) writeWorker(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
-	notify, err := fn(ctx, tx)
-	if err != nil {
+	if err := fn(ctx, tx); err != nil {
 		return err
-	}
-
-	if notify {
-		payload, err := marshalWorkerEvent(eventType, worker)
-		if err != nil {
-			return fmt.Errorf("marshaling worker event: %w", err)
-		}
-		if len(payload) > maxNotifyPayloadBytes {
-			return fmt.Errorf("worker event payload of %d bytes exceeds PostgreSQL NOTIFY limit of %d bytes", len(payload), maxNotifyPayloadBytes)
-		}
-		if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, workerChangeChannel, string(payload)); err != nil {
-			return fmt.Errorf("notifying worker change: %w", err)
-		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1129,15 +1077,12 @@ func (p *Persistence) CreateWorker(ctx context.Context, worker *ateapipb.Worker)
 		return fmt.Errorf("marshaling worker: %w", err)
 	}
 
-	err = p.writeAndNotify(ctx, store.WorkerEventCreated, dbWorker, func(ctx context.Context, tx pgx.Tx) (bool, error) {
+	err = p.writeWorker(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO workers (worker_namespace, worker_pool, worker_pod, version, proto)
 			VALUES ($1, $2, $3, $4, $5)`,
 			dbWorker.GetWorkerNamespace(), dbWorker.GetWorkerPool(), dbWorker.GetWorkerPod(), dbWorker.GetVersion(), protoBytes)
-		if err != nil {
-			return false, err
-		}
-		return true, nil
+		return err
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -1180,7 +1125,7 @@ func (p *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 		return fmt.Errorf("marshaling worker: %w", err)
 	}
 
-	return p.writeAndNotify(ctx, store.WorkerEventUpdated, dbWorker, func(ctx context.Context, tx pgx.Tx) (bool, error) {
+	return p.writeWorker(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var returned []byte
 		err := tx.QueryRow(ctx, `
 			UPDATE workers
@@ -1191,26 +1136,25 @@ func (p *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 			dbWorker.GetVersion(), protoBytes, namespace, poolName, pod, expectedVersion,
 		).Scan(&returned)
 		if err == nil {
-			return true, nil
+			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
-			return false, fmt.Errorf("updating worker %s/%s/%s: %w", namespace, poolName, pod, err)
+			return fmt.Errorf("updating worker %s/%s/%s: %w", namespace, poolName, pod, err)
 		}
 
 		current, getErr := getWorkerRow(ctx, tx, namespace, poolName, pod)
 		if getErr != nil {
-			return false, getErr
+			return getErr
 		}
 		if current.GetVersion() != expectedVersion {
-			return false, store.ErrVersionConflict
+			return store.ErrVersionConflict
 		}
-		return false, fmt.Errorf("update worker %s/%s/%s: no row matched but current state is otherwise consistent", namespace, poolName, pod)
+		return fmt.Errorf("update worker %s/%s/%s: no row matched but current state is otherwise consistent", namespace, poolName, pod)
 	})
 }
 
 func (p *Persistence) DeleteWorker(ctx context.Context, namespace, poolName, pod string) error {
-	deletedEvent := &ateapipb.Worker{WorkerNamespace: namespace, WorkerPod: pod}
-	return p.writeAndNotify(ctx, store.WorkerEventDeleted, deletedEvent, func(ctx context.Context, tx pgx.Tx) (bool, error) {
+	return p.writeWorker(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var protoBytes []byte
 		err := tx.QueryRow(ctx, `
 			DELETE FROM workers
@@ -1218,12 +1162,12 @@ func (p *Persistence) DeleteWorker(ctx context.Context, namespace, poolName, pod
 			RETURNING proto`, namespace, poolName, pod).Scan(&protoBytes)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// Idempotent: nothing existed, so nothing to notify either.
-				return false, nil
+				// Idempotent: nothing existed, so no row change and no event.
+				return nil
 			}
-			return false, fmt.Errorf("deleting worker %s/%s/%s: %w", namespace, poolName, pod, err)
+			return fmt.Errorf("deleting worker %s/%s/%s: %w", namespace, poolName, pod, err)
 		}
-		return true, nil
+		return nil
 	})
 }
 
@@ -1277,52 +1221,8 @@ func (p *Persistence) ListWorkers(ctx context.Context, opts store.ListOptions) (
 	return store.ListResponse[*ateapipb.Worker]{Items: result, NextPageToken: nextToken}, nil
 }
 
-// WatchWorkers acquires a dedicated connection (hijacked out of the pool, so
-// it's never handed back for unrelated queries), LISTENs on the fixed
-// worker-change channel, and forwards decoded notifications until the
-// context is cancelled or the caller closes the watch.
-func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, error) {
-	watchCtx, cancel := context.WithCancel(ctx)
-
-	poolConn, err := p.pool.Acquire(watchCtx)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("acquiring watch connection: %w", err)
-	}
-	conn := poolConn.Hijack()
-
-	if _, err := conn.Exec(watchCtx, "LISTEN "+workerChangeChannel); err != nil {
-		conn.Close(watchCtx) //nolint:errcheck
-		cancel()
-		return nil, fmt.Errorf("listening for worker changes: %w", err)
-	}
-
-	ch := make(chan store.WorkerEvent, 128)
-	go func() {
-		defer close(ch)
-		defer conn.Close(context.Background()) //nolint:errcheck
-		for {
-			notification, err := conn.WaitForNotification(watchCtx)
-			if err != nil {
-				// Context cancelled (caller closed the watch) or the
-				// connection was lost. Either way, the caller must
-				// re-subscribe; matches ateredis's WatchWorkers contract.
-				return
-			}
-			event, err := unmarshalWorkerEvent(notification.Payload)
-			if err != nil {
-				slog.ErrorContext(ctx, "worker event unmarshal failed", slog.Any("err", err))
-				continue
-			}
-			select {
-			case ch <- event:
-			case <-watchCtx.Done():
-				return
-			}
-		}
-	}()
-	return store.NewWorkerWatch(ch, cancel), nil
-}
+// WatchWorkers is implemented in logicalrepl.go: a temporary logical
+// replication slot streaming pgoutput changes for the workers table.
 
 // --- Workflow locks ---
 

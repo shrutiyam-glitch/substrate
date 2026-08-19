@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
@@ -67,6 +68,13 @@ func requirePool(t *testing.T) *pgxpool.Pool {
 			postgres.WithDatabase("atepg"),
 			postgres.WithUsername("atepg"),
 			postgres.WithPassword("atepg"),
+			// WatchWorkers streams via logical replication (logicalrepl.go);
+			// one slot/walsender per concurrent watch in tests.
+			testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+				ContainerRequest: testcontainers.ContainerRequest{
+					Cmd: []string{"-c", "wal_level=logical", "-c", "max_wal_senders=20", "-c", "max_replication_slots=20"},
+				},
+			}),
 		)
 		if err != nil {
 			containerErr = err
@@ -148,9 +156,9 @@ func TestCreateActor_MissingAtespace_FailedPrecondition(t *testing.T) {
 	}
 }
 
-// TestWorkerNotification_OnlyAfterCommit proves the doc's atomicity claim: a
-// worker write's pg_notify shares the write's transaction, so a rolled-back
-// write never notifies, while a committed write always does.
+// TestWorkerNotification_OnlyAfterCommit proves the atomicity claim: worker
+// events are decoded from committed WAL, so a rolled-back write can never
+// produce an event, while a committed write always does.
 func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 	s := setupPostgresStore(t).(*Persistence)
 	ctx := context.Background()
@@ -167,9 +175,9 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 		t.Fatalf("marshaling worker: %v", err)
 	}
 
-	// Write the row and roll back instead of committing: no notification
-	// should ever arrive, proving pg_notify's effect is undone with the rest
-	// of the transaction.
+	// Write the row and roll back instead of committing: no event should
+	// ever arrive, because logical decoding only emits committed
+	// transactions.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin failed: %v", err)
@@ -180,16 +188,13 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 		worker.GetWorkerNamespace(), worker.GetWorkerPool(), worker.GetWorkerPod(), int64(1), protoBytes); err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, workerChangeChannel, "rolled-back-payload"); err != nil {
-		t.Fatalf("pg_notify failed: %v", err)
-	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("Rollback failed: %v", err)
 	}
 
 	select {
 	case event := <-watch.Events:
-		t.Fatalf("received event %+v from a rolled-back transaction; NOTIFY should not survive rollback", event)
+		t.Fatalf("received event %+v from a rolled-back transaction; aborted writes must not be decoded", event)
 	case <-time.After(500 * time.Millisecond):
 		// Expected: nothing arrives.
 	}
@@ -209,6 +214,70 @@ func TestWorkerNotification_OnlyAfterCommit(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for event from a committed write")
+	}
+}
+
+// TestWatchWorkersSnapshot_SeedsThenStreams proves the exported-snapshot
+// contract: the watch first delivers every worker that existed at slot
+// creation (read under the slot's exported snapshot, so exactly the stream's
+// starting point), then live changes — no separate relist, no race window.
+func TestWatchWorkersSnapshot_SeedsThenStreams(t *testing.T) {
+	s := setupPostgresStore(t).(*Persistence)
+	ctx := context.Background()
+
+	preexisting := []*ateapipb.Worker{
+		{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "pod-a"},
+		{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "pod-b"},
+	}
+	for _, w := range preexisting {
+		if err := s.CreateWorker(ctx, w); err != nil {
+			t.Fatalf("CreateWorker(%s) failed: %v", w.GetWorkerPod(), err)
+		}
+	}
+
+	watch, err := s.WatchWorkersSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("WatchWorkersSnapshot failed: %v", err)
+	}
+	defer watch.Close()
+
+	// Seed phase: exactly the pre-existing workers, as Created events, in
+	// unspecified order.
+	seeded := map[string]*ateapipb.Worker{}
+	for range preexisting {
+		select {
+		case event := <-watch.Events:
+			if event.Type != store.WorkerEventCreated {
+				t.Fatalf("seed event type = %v, want WorkerEventCreated", event.Type)
+			}
+			seeded[event.Worker.GetWorkerPod()] = event.Worker
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for snapshot seed events")
+		}
+	}
+	for _, want := range preexisting {
+		got, ok := seeded[want.GetWorkerPod()]
+		if !ok {
+			t.Fatalf("seed missing worker %s", want.GetWorkerPod())
+		}
+		want.Version = 1 // CreateWorker assigns version 1 server-side.
+		if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
+			t.Errorf("seeded worker %s mismatch (-want +got):\n%s", want.GetWorkerPod(), diff)
+		}
+	}
+
+	// Stream phase: a write after subscribe arrives as a live event.
+	live := &ateapipb.Worker{WorkerNamespace: "ns", WorkerPool: "pool", WorkerPod: "pod-c"}
+	if err := s.CreateWorker(ctx, live); err != nil {
+		t.Fatalf("CreateWorker(pod-c) failed: %v", err)
+	}
+	select {
+	case event := <-watch.Events:
+		if event.Type != store.WorkerEventCreated || event.Worker.GetWorkerPod() != "pod-c" {
+			t.Fatalf("live event = %v %s, want Created pod-c", event.Type, event.Worker.GetWorkerPod())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for live event after snapshot seed")
 	}
 }
 
