@@ -21,18 +21,30 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
 )
 
-// useBundledPostgres reports whether ateapi uses the in-cluster database
-// (when no external DSN is configured). Gates applying the bundled StatefulSet
-// and waiting on its rollout in DeployAteSystem.
-func (e *Env) useBundledPostgres() bool {
-	return e.Cfg.PostgresConnectionString == ""
+// useBundledPostgres reports whether ateapi uses the in-cluster database,
+// which it does when neither an external DSN nor a Cloud SQL instance is
+// configured. Gates applying the bundled StatefulSet and waiting on its
+// rollout in DeployAteSystem.
+func (e *Env) useBundledPostgres(ctx context.Context) (bool, error) {
+	if e.Cfg.PostgresConnectionString != "" {
+		return false, nil
+	}
+	cloudSQL, err := e.CloudSQL(ctx)
+	if err != nil {
+		return false, err
+	}
+	return !cloudSQL.Enabled(), nil
 }
 
 // applyBundledPostgres applies the bundled PostgreSQL StatefulSet, or logs that
 // it was skipped in favor of an external database.
 func (e *Env) applyBundledPostgres(ctx context.Context) error {
-	if !e.useBundledPostgres() {
-		log.Step("Skipping bundled PostgreSQL: external database configured (ATE_API_POSTGRES_CONNECTION_STRING)")
+	bundled, err := e.useBundledPostgres(ctx)
+	if err != nil {
+		return err
+	}
+	if !bundled {
+		log.Step("Skipping bundled PostgreSQL: external database configured")
 		return nil
 	}
 	return e.Kube.ApplyPath(ctx, e.Cfg.Manifest("postgres", "postgres.yaml"))

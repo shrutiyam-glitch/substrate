@@ -135,7 +135,7 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := e.Kube.ApplyBytes(ctx, manifests); err != nil {
+	if err := e.applyManifest(ctx, manifests); err != nil {
 		return err
 	}
 
@@ -157,7 +157,11 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 	// Only when the bundled StatefulSet was applied above; an external
 	// database means it never gets deployed, and waiting on it would block
 	// until the timeout on an object that will never exist.
-	if e.useBundledPostgres() {
+	bundledPostgres, err := e.useBundledPostgres(ctx)
+	if err != nil {
+		return err
+	}
+	if bundledPostgres {
 		waits = append(waits, rollout{kube.KindStatefulSet, "postgres"})
 	}
 	waits = append(waits,
@@ -234,7 +238,11 @@ func (e *Env) DeployAteAPIServer(ctx context.Context) error {
 	if err := e.applyOtelConfig(ctx); err != nil {
 		return err
 	}
-	if err := e.ResolveAndApply(ctx, e.Cfg.Manifest("ate-api-server.yaml")); err != nil {
+	manifest, err := e.ResolveManifest(ctx, e.Cfg.Manifest("ate-api-server.yaml"))
+	if err != nil {
+		return err
+	}
+	if err := e.applyManifest(ctx, manifest); err != nil {
 		return err
 	}
 	return e.Kube.RolloutStatus(ctx, kube.KindDeployment, NamespaceAteSystem, "ate-api-server", e.Cfg.RolloutTimeout)

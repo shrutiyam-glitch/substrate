@@ -15,7 +15,7 @@ It uses a hierarchical command structure:
         *   `iam` - Create IAM policy bindings and grant permissions.
         *   `dashboards` - Create Cloud Monitoring dashboards.
         *   `cloudsql` - Create a Cloud SQL PostgreSQL instance for the ateapi store, with IAM database authentication (see [cloud-sql.md](cloud-sql.md)).
-    *   `bootstrap` - Run all setup steps in order.
+    *   `bootstrap` - Run all setup steps in order, plus `cloudsql` with `--cloudsql`.
 
 ## Prerequisites
 
@@ -268,8 +268,42 @@ go run ./tools/setup-gcp bootstrap [flags]
 | `--boot-disk-type` | Boot disk type for the node pool (empty = GKE default). | `BOOT_DISK_TYPE` | None |
 | `--bucket-name` | Name of the GCS bucket for snapshots. | `BUCKET_NAME` | None (Required*) |
 | `--dashboard-dir` | Directory containing dashboard JSON files. | `DASHBOARD_DIR` | `tools/setup-gcp/dashboards` |
+| `--cloudsql` | Also provision the Cloud SQL instance backing the ateapi store. | `CLOUDSQL_ENABLED` | `false` |
+| `--cloudsql-instance` | Cloud SQL instance name. | `CLOUDSQL_INSTANCE` | `atepg` |
+| `--cloudsql-tier` | Machine tier. | `CLOUDSQL_TIER` | `db-custom-2-8192` |
+| `--cloudsql-edition` | `enterprise` or `enterprise-plus`. | `CLOUDSQL_EDITION` | `enterprise` |
+| `--cloudsql-storage-size` | Data disk size in GB (0 = Cloud SQL default). | `CLOUDSQL_STORAGE_GB` | None |
+| `--cloudsql-gsa-name` | Google service account for Workload Identity + IAM database auth. | `CLOUDSQL_GSA_NAME` | `ate-api-server` |
 
 *\*Note: Required unless the `BUCKET_NAME` environment variable is set.*
+
+#### The Cloud SQL step
+
+Without `--cloudsql`, bootstrap provisions no database and ateapi runs against
+the single-replica PostgreSQL StatefulSet the installer bundles in the cluster.
+That is the right default for development, and the reason this step is opt-in:
+a Cloud SQL instance bills by the hour, and its private IP needs [private
+services access](https://cloud.google.com/sql/docs/postgres/configure-private-services-access)
+on the VPC — a one-time-per-VPC setup the tool checks for and prints the
+`gcloud` commands for, but does not create.
+
+With the flag, the step runs immediately after the cluster (its Workload
+Identity binding names the pool that step enables) and does exactly what
+[`create cloudsql`](cloud-sql.md) does. The instance is created in `--region`,
+and `--cluster-location` must be that region or a zone inside it, so the two
+cannot silently diverge. Everything is idempotent, so re-running a bootstrap
+against an existing instance reconciles rather than fails.
+
+The last thing the step does is grant the IAM database user the schema
+privileges `ateapi` needs to run its migrations, by running `psql` as a Job on
+the cluster — the only place with a route to a private IP. Doing that requires
+a password on the built-in `postgres` user, so the step sets one and then
+replaces it with another random value; **any `postgres` password you were
+keeping for admin access is lost**. When there is no reachable cluster, which
+`create cloudsql` allows, the step logs the SQL instead of running it.
+
+That leaves pointing the installer at the instance, which is printed when the
+run finishes and detailed in [cloud-sql.md](cloud-sql.md).
 
 ## Examples
 
@@ -289,6 +323,12 @@ go run ./tools/setup-gcp bootstrap
 go run ./tools/setup-gcp bootstrap \
   --cluster-name="custom-cluster" \
   --machine-type="n2-standard-8"
+```
+
+### Bootstrap with Cloud SQL instead of the in-cluster database
+
+```bash
+go run ./tools/setup-gcp bootstrap --cloudsql --cloudsql-tier="db-custom-4-16384"
 ```
 
 ### Only create the cluster (using env vars for defaults)

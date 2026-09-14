@@ -18,6 +18,8 @@ import (
 	"testing"
 
 	"cloud.google.com/go/iam/apiv1/iampb"
+	"github.com/spf13/cobra"
+	servicenetworking "google.golang.org/api/servicenetworking/v1"
 )
 
 func TestCloudSQLIdentityDerivations(t *testing.T) {
@@ -138,5 +140,81 @@ func TestAddProjectIamBindingCloudSQLRoles(t *testing.T) {
 		if addProjectIamBinding(policy, role, member) {
 			t.Errorf("addProjectIamBinding(%q) = true on repeat add, want false", role)
 		}
+	}
+}
+
+// registerCloudSQLFlags serves both spellings: `create cloudsql --tier` and
+// `bootstrap --cloudsql-tier`, writing to the same Config fields either way.
+func TestRegisterCloudSQLFlags(t *testing.T) {
+	settings := []string{"instance", "tier", "edition", "storage-size", "gsa-name"}
+
+	for _, prefix := range []string{"", "cloudsql-"} {
+		cmd := &cobra.Command{Use: "test"}
+		registerCloudSQLFlags(cmd, prefix)
+
+		for _, name := range settings {
+			if cmd.Flags().Lookup(prefix+name) == nil {
+				t.Errorf("registerCloudSQLFlags(%q) did not register --%s%s", prefix, prefix, name)
+			}
+		}
+		// Nothing shared with the cluster's own flags: bootstrap registers
+		// --machine-type and --cluster-version next to these.
+		if prefix != "" {
+			for _, name := range settings {
+				if cmd.Flags().Lookup(name) != nil {
+					t.Errorf("registerCloudSQLFlags(%q) also registered the unprefixed --%s", prefix, name)
+				}
+			}
+		}
+	}
+
+	// The defaults land in the shared Config the commands provision from.
+	cmd := &cobra.Command{Use: "test"}
+	registerCloudSQLFlags(cmd, "cloudsql-")
+	if err := cmd.Flags().Parse([]string{"--cloudsql-instance=other", "--cloudsql-storage-size=250"}); err != nil {
+		t.Fatalf("Parse() = %v", err)
+	}
+	if cfg.CloudSQLInstance != "other" {
+		t.Errorf("cfg.CloudSQLInstance = %q, want %q", cfg.CloudSQLInstance, "other")
+	}
+	if cfg.CloudSQLStorageGB != 250 {
+		t.Errorf("cfg.CloudSQLStorageGB = %d, want 250", cfg.CloudSQLStorageGB)
+	}
+}
+
+func TestHasReservedPeeringRange(t *testing.T) {
+	tests := []struct {
+		name  string
+		conns []*servicenetworking.Connection
+		want  bool
+	}{
+		{"no connections", nil, false},
+		{
+			"connection without a range",
+			[]*servicenetworking.Connection{{}},
+			false,
+		},
+		{
+			"connection with a range",
+			[]*servicenetworking.Connection{{ReservedPeeringRanges: []string{"google-managed-services-default"}}},
+			true,
+		},
+		{
+			// The range is shared by every service producer on the VPC, so a
+			// peering listed second satisfies Cloud SQL just as well.
+			"range on a later connection",
+			[]*servicenetworking.Connection{
+				{},
+				{ReservedPeeringRanges: []string{"google-managed-services-default"}},
+			},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasReservedPeeringRange(tt.conns); got != tt.want {
+				t.Errorf("hasReservedPeeringRange() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -24,7 +24,7 @@ import (
 )
 
 // ate-api-server resolves --postgres-connection-string=@env and
-// --postgres-schema=@env from this ConfigMap. These are the keys the shell
+// --postgres-schema=@env from this Secret. These are the keys the shell
 // installer writes, and an empty value for either makes the apiserver exit
 // ("--postgres-connection-string is required", "PostgreSQL schema must not be
 // empty"), so both the key set and the values are pinned here.
@@ -42,6 +42,31 @@ func TestBuildAPIServerEnvVars(t *testing.T) {
 	}
 	if got["ATE_API_POSTGRES_SCHEMA"] != "public" {
 		t.Errorf("ATE_API_POSTGRES_SCHEMA = %q, want %q", got["ATE_API_POSTGRES_SCHEMA"], "public")
+	}
+}
+
+func TestRedactDSNPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dsn  string
+		want string
+	}{
+		{
+			name: "no password to hide",
+			dsn:  "user=ate host=127.0.0.1 port=5432 dbname=atepg sslmode=disable",
+			want: "user=ate host=127.0.0.1 port=5432 dbname=atepg sslmode=disable",
+		},
+		{
+			name: "password hidden",
+			dsn:  "user=ate password=hunter2 host=db.example dbname=atepg",
+			want: "user=ate password=<redacted> host=db.example dbname=atepg",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactDSNPassword(tc.dsn); got != tc.want {
+				t.Errorf("redactDSNPassword() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

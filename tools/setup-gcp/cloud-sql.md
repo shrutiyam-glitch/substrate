@@ -20,8 +20,8 @@ authentication**](https://docs.cloud.google.com/sql/docs/postgres/iam-authentica
   nothing to store, leak, or rotate; access is revoked in IAM.
 - **Cloud-agnostic code** — ateapi itself knows nothing about Cloud SQL. The
   sidecar is a deployment-time patch
-  (`manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml`) applied by
-  `hack/install-ate.sh` only when a Cloud SQL instance is configured.
+  (`manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml`) applied by the
+  installer only when a Cloud SQL instance is configured.
 
 ## 1. Provision
 
@@ -35,6 +35,16 @@ missing). Then:
 export PROJECT_ID=<project>
 go run ./tools/setup-gcp create cloudsql --region=<cluster region>
 # other flags: --instance, --tier, --edition, --storage-size, --gsa-name, --network
+# --cluster-name and --cluster-location name the cluster the grants in step 2
+# run from; they default to the same values the cluster commands use.
+```
+
+A new environment can provision the instance along with everything else, in
+which case the same settings take a `--cloudsql-` prefix, and the region comes
+from the cluster's:
+
+```sh
+go run ./tools/setup-gcp bootstrap --cloudsql
 ```
 
 This idempotently creates:
@@ -65,24 +75,39 @@ Backups, point-in-time recovery, and the shape of an existing instance are
 never reconciled — the settings above apply at creation. Change them later
 with `gcloud sql instances patch`.
 
-## 2. One-time schema privileges
+## 2. Schema privileges
 
 [IAM database users](https://docs.cloud.google.com/sql/docs/postgres/add-manage-iam-users)
 are created with no privileges, and PostgreSQL 15+ removed
 `PUBLIC`'s `CREATE` on the `public` schema. Before serving, `ateapi` runs versioned
-migrations to create its tables. The connecting user needs DDL rights to do this.
-Grant them once as the built-in `postgres` user (note the database username is
-the GSA email **without** `.gserviceaccount.com`):
+migrations to create its tables, and the connecting user needs DDL rights to do
+this. Provisioning grants them as its last step, so there is normally nothing
+to do here:
 
 ```sql
 GRANT CREATE ON DATABASE atepg TO "ate-api-server@<project>.iam";
 GRANT USAGE, CREATE ON SCHEMA public TO "ate-api-server@<project>.iam";
 ```
 
-Getting that `postgres` session on a private-IP-only instance takes two
-steps: give `postgres` a temporary password (fresh instances have none), and
-run `psql` from inside the cluster, which is the only place with a network
-path to the instance:
+Only the built-in `postgres` user can issue those, and the instance has no
+public address, so `setup-gcp` sets a random password on `postgres`, runs
+`psql` as a Job on the cluster — the one place with a network path to the
+instance — and then sets the password to another random value. The Job and the
+Secret holding the password are deleted afterwards. Both grants are idempotent,
+so provisioning can be rerun.
+
+> [!WARNING]
+> This resets the `postgres` password every time it runs. Nothing deployed uses
+> that password, but if you kept one for admin access such as Cloud SQL Studio,
+> set it again afterwards with `gcloud sql users set-password postgres`.
+
+`postgres` is not a superuser on Cloud SQL: it can list the IAM user's tables
+but needs explicit `GRANT SELECT` from that user to read them.
+
+**If no cluster was reachable** — `create cloudsql` run against a project that
+has none yet — provisioning logs a warning with the SQL instead, and `ateapi`
+will fail its migrations until it is applied. Rerun `create cloudsql` once the
+cluster exists, or do it by hand:
 
 ```sh
 gcloud sql users set-password postgres --instance=<instance> --password='<temp-pw>'
@@ -92,15 +117,8 @@ kubectl run psql-grant --rm -i --restart=Never --image=postgres:18-alpine -- \
   -c 'GRANT CREATE ON DATABASE atepg TO "ate-api-server@<project>.iam"; GRANT USAGE, CREATE ON SCHEMA public TO "ate-api-server@<project>.iam";'
 ```
 
-Nothing deployed ever uses this password — afterwards you can scramble it
-(`gcloud sql users set-password postgres --instance=<instance>
---password="$(openssl rand -hex 16)"`) or keep it for admin access such as
-Cloud SQL Studio. Note that `postgres` is not a superuser on Cloud SQL: it
-can list the IAM user's tables but needs explicit `GRANT SELECT` from that
-user to read them.
-
 If the `atepg` tables already exist from a previous password-based user,
-transfer ownership instead (future in-place DDL requires it):
+transfer ownership as well (future in-place DDL requires it):
 
 ```sql
 GRANT "ate-api-server@<project>.iam" TO "<olduser>";
@@ -112,9 +130,14 @@ REASSIGN OWNED BY "<olduser>" TO "ate-api-server@<project>.iam";  -- run inside 
 ```sh
 export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=<project>:<region>:<instance>
 export ATE_API_POSTGRES_CLOUDSQL_GSA=ate-api-server@<project>.iam.gserviceaccount.com
-./hack/install-ate.sh --deploy-ate-system
-# Existing installation: --deploy-ate-apiserver instead of --deploy-ate-system
+go run ./cmd/ate-setup deploy ate-system
+# Existing installation: deploy apiserver instead of deploy ate-system
 ```
+
+`ate-setup` also takes the two as flags, `--cloudsql-instance` and
+`--cloudsql-gsa`, which is what a CI job that installs into several clusters
+wants. `./hack/install-ate.sh --deploy-ate-system` reads the same two
+environment variables and produces the same deployment.
 
 What this does differently from a plain install:
 

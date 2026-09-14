@@ -30,6 +30,8 @@ a pre-scan pass, so they may appear anywhere on its command line.
 | `--context NAME` | `KUBECTL_CONTEXT=NAME` | Kubeconfig context; still defaults to `KUBECTL_CONTEXT` |
 | `--kubeconfig PATH` | `KUBECONFIG=PATH` | Explicit kubeconfig path |
 | `--no-dev-env` | `NO_DEV_ENV=1` | Skip `.ate-dev-env.sh` at the repository root |
+| `--cloudsql-instance PROJECT:REGION:INSTANCE` | `ATE_API_POSTGRES_CLOUDSQL_INSTANCE=...` | Back the store with a Cloud SQL instance instead of the bundled PostgreSQL. Passed empty, it moves the store back; omitted entirely, the cluster's current instance is kept |
+| `--cloudsql-gsa EMAIL` | `ATE_API_POSTGRES_CLOUDSQL_GSA=EMAIL` | The service account that is that instance's IAM database user |
 | `--version` / `-v` | — | New; the shell installer had no version |
 | `--image-repo REPO` | — | New. Install pre-built images from `REPO` instead of building them with `ko` |
 | `--image-tag TAG` | — | New. The tag those images carry. Each of the two requires the other |

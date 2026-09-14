@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Strategic-merge patch adding a Cloud SQL Auth Proxy sidecar to
-# ate-api-server. Applied by hack/install-ate.sh only when
-# ATE_API_POSTGRES_CLOUDSQL_INSTANCE is set.
+# ate-api-server. Applied by cmd/ate-setup and hack/install-ate.sh alike, only
+# when ATE_API_POSTGRES_CLOUDSQL_INSTANCE is set.
 #
 # The proxy owns transport security (TLS 1.3 tunnel with ephemeral
 # certificates and instance identity verification) and, with
@@ -24,9 +24,8 @@
 # 127.0.0.1:5432 in plaintext that never leaves the pod's network namespace.
 #
 # All CSQL_PROXY_* configuration comes from the ate-api-server-envvars
-# ConfigMap (written by install-ate.sh); the instance connection name is the
-# proxy's single positional argument, expanded by Kubernetes from the same
-# ConfigMap.
+# ConfigMap the installer writes; the instance connection name is the proxy's
+# single positional argument, expanded by Kubernetes from the same ConfigMap.
 spec:
   template:
     spec:

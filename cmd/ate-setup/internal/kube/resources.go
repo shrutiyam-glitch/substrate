@@ -89,6 +89,34 @@ func (c *Client) ConfigMapExists(ctx context.Context, namespace, name string) (b
 	return true, nil
 }
 
+// ConfigMapValue returns one key of a ConfigMap. A missing ConfigMap and a
+// missing key both read as empty, so that callers reading a cluster's recorded
+// configuration do not have to tell "never installed" from "installed without
+// this setting".
+func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string) (string, error) {
+	cm, err := c.Typed.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("while getting configmap %s/%s: %w", namespace, name, err)
+	}
+	return cm.Data[key], nil
+}
+
+// ServiceAccountAnnotation returns one annotation of a ServiceAccount, empty
+// when either the ServiceAccount or the annotation is absent.
+func (c *Client) ServiceAccountAnnotation(ctx context.Context, namespace, name, key string) (string, error) {
+	sa, err := c.Typed.CoreV1().ServiceAccounts(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("while getting serviceaccount %s/%s: %w", namespace, name, err)
+	}
+	return sa.Annotations[key], nil
+}
+
 // DeploymentExists reports whether a Deployment is present. delete_demo_actors
 // used this to decide whether the control plane is still up before trying to
 // talk to it.

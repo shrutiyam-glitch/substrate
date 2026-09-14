@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,57 @@ const DefaultPostgresSchema = "public"
 
 // devEnvFile is the optional per-developer environment script at the repo root.
 const devEnvFile = ".ate-dev-env.sh"
+
+// CloudSQLDatabase is the database ateapi uses on a Cloud SQL instance. It
+// matches what `setup-gcp create cloudsql` creates.
+const CloudSQLDatabase = "atepg"
+
+// gsaEmailSuffix is what a Google service account email carries and its IAM
+// database username does not.
+const gsaEmailSuffix = ".gserviceaccount.com"
+
+// CloudSQL points the ateapi store at Cloud SQL for PostgreSQL, reached
+// through the Auth Proxy sidecar with IAM database authentication.
+//
+// That is the one configuration installed here, and the one
+// `setup-gcp create cloudsql` provisions: a private-IP instance with
+// cloudsql.iam_authentication on. Public and PSC instances, and password
+// authentication, stay with hack/install-ate.sh.
+type CloudSQL struct {
+	// Instance is the instance connection name, project:region:instance.
+	Instance string
+
+	// GSA is the Google service account that is the instance's IAM database
+	// user, and that the ate-api-server ServiceAccount impersonates through
+	// Workload Identity.
+	GSA string
+
+	// Named records that this run said what the configuration is, including
+	// naming it empty to take Cloud SQL back out. When it is false the
+	// installer adopts whatever the cluster already runs, so that a deploy
+	// from a shell that never exported the variables does not quietly move
+	// the store back to the in-cluster database.
+	Named bool
+}
+
+// Enabled reports whether the apiserver is backed by Cloud SQL.
+func (c CloudSQL) Enabled() bool { return c.Instance != "" }
+
+// DatabaseUser is the IAM database username for the service account: the
+// email with its .gserviceaccount.com suffix trimmed, which is the form Cloud
+// SQL registers the user under and PostgreSQL sees.
+func (c CloudSQL) DatabaseUser() string {
+	return strings.TrimSuffix(c.GSA, gsaEmailSuffix)
+}
+
+// DSN is the connection string ateapi reaches the instance with. It is
+// passwordless and unencrypted because it never leaves the pod: the proxy
+// listens on pod-local loopback and owns both the TLS tunnel to the instance
+// and the IAM token the database session authenticates with.
+func (c CloudSQL) DSN() string {
+	return fmt.Sprintf("user=%s host=127.0.0.1 port=5432 dbname=%s sslmode=disable",
+		c.DatabaseUser(), CloudSQLDatabase)
+}
 
 // Config is the fully resolved installation environment. Fields sourced from
 // the developer environment keep their shell names in the comments so the
@@ -103,6 +155,9 @@ type Config struct {
 	// PostgresSchema is the PostgreSQL schema for the Substrate tables
 	// (ATE_API_POSTGRES_SCHEMA). Empty means DefaultPostgresSchema.
 	PostgresSchema string
+	// CloudSQL backs the store with Cloud SQL instead of the bundled
+	// PostgreSQL StatefulSet. Its zero value leaves the store in-cluster.
+	CloudSQL CloudSQL
 
 	// RolloutTimeout is the timeout duration for rollout status checks.
 	RolloutTimeout time.Duration
@@ -150,6 +205,13 @@ type Options struct {
 	// Image source selection.
 	ImageRepo string
 	ImageTag  string
+
+	// Cloud SQL store selection. CloudSQLNamed is set by the root command
+	// when --cloudsql-instance was passed at all, so that passing it empty
+	// reads as "take Cloud SQL out" rather than "say nothing".
+	CloudSQLInstance string
+	CloudSQLGSA      string
+	CloudSQLNamed    bool
 
 	// NoDevEnv skips sourcing .ate-dev-env.sh even when it exists.
 	NoDevEnv bool
@@ -222,6 +284,7 @@ func Load(opts Options) (*Config, error) {
 		Images:                         loadImageSource(opts, env),
 		PostgresConnectionString:       env["ATE_API_POSTGRES_CONNECTION_STRING"],
 		PostgresSchema:                 env["ATE_API_POSTGRES_SCHEMA"],
+		CloudSQL:                       loadCloudSQL(opts, env),
 		RolloutTimeout:                 rolloutTimeout,
 		rolloutTimeoutSet:              timeoutStr != "",
 		PodcertWorkersPerSigner:        podcertWorkers,
@@ -251,6 +314,29 @@ func loadImageSource(opts Options, env map[string]string) images.Source {
 		Repo: strings.TrimSuffix(firstNonEmpty(opts.ImageRepo, env["ATE_IMAGE_REPO"]), "/"),
 		Tag:  firstNonEmpty(opts.ImageTag, env["ATE_IMAGE_TAG"]),
 	}
+}
+
+// loadCloudSQL resolves the Cloud SQL store settings.
+//
+// Presence decides whether the run named a configuration, not emptiness:
+// ATE_API_POSTGRES_CLOUDSQL_INSTANCE="" is how the shell installer is told to
+// take Cloud SQL out, and --cloudsql-instance="" says the same here. Saying
+// nothing at all leaves Named false, and the installer adopts the cluster's.
+func loadCloudSQL(opts Options, env map[string]string) CloudSQL {
+	cs := CloudSQL{
+		Instance: opts.CloudSQLInstance,
+		GSA:      opts.CloudSQLGSA,
+		Named:    opts.CloudSQLNamed,
+	}
+	if !cs.Named {
+		if instance, ok := env["ATE_API_POSTGRES_CLOUDSQL_INSTANCE"]; ok {
+			cs.Instance, cs.Named = instance, true
+		}
+	}
+	if cs.GSA == "" {
+		cs.GSA = env["ATE_API_POSTGRES_CLOUDSQL_GSA"]
+	}
+	return cs
 }
 
 func applyKindDefaults(cfg *Config) {
@@ -285,6 +371,50 @@ func validate(cfg *Config) error {
 		if cfg.Router != RouterEnvoy {
 			return fmt.Errorf("--experimental-additional-egress-extproc-service requires --atenet-router=envoy")
 		}
+	}
+	return validateCloudSQL(cfg)
+}
+
+// validateCloudSQL checks the Cloud SQL settings, and rejects the variants
+// hack/install-ate.sh supports and this installer does not.
+//
+// Rejecting beats ignoring: an operator whose environment carries
+// ATE_API_POSTGRES_CLOUDSQL_IP_TYPE=public has said something specific about
+// where the database is, and silently installing the private-IP-and-IAM-auth
+// configuration anyway would produce an apiserver that cannot reach it.
+func validateCloudSQL(cfg *Config) error {
+	for _, unsupported := range []struct{ name, supported string }{
+		{"ATE_API_POSTGRES_CLOUDSQL_IP_TYPE", "private"},
+		{"ATE_API_POSTGRES_CLOUDSQL_IAM_AUTH", "true"},
+	} {
+		value := cfg.shellEnv[unsupported.name]
+		if value != "" && value != unsupported.supported {
+			return fmt.Errorf("%s=%s is not supported by ate-setup, which installs Cloud SQL one way: "+
+				"a private-IP instance with IAM database authentication. Use hack/install-ate.sh for anything else "+
+				"(see cmd/ate-setup/differences.md)", unsupported.name, value)
+		}
+	}
+
+	cs := cfg.CloudSQL
+	if !cs.Enabled() {
+		return nil
+	}
+	// project:region:instance, the form Cloud SQL calls an instance
+	// connection name and the proxy takes as its one argument.
+	if parts := strings.Split(cs.Instance, ":"); len(parts) != 3 || slices.Contains(parts, "") {
+		return fmt.Errorf("--cloudsql-instance must be an instance connection name, project:region:instance, got %q", cs.Instance)
+	}
+	if cs.GSA == "" {
+		return fmt.Errorf("--cloudsql-instance requires --cloudsql-gsa (or ATE_API_POSTGRES_CLOUDSQL_GSA), " +
+			"the service account that is the instance's IAM database user")
+	}
+	if !strings.HasSuffix(cs.GSA, gsaEmailSuffix) {
+		return fmt.Errorf("--cloudsql-gsa must be a service account email ending in %s, got %q", gsaEmailSuffix, cs.GSA)
+	}
+	if cfg.PostgresConnectionString != "" {
+		return fmt.Errorf("ATE_API_POSTGRES_CONNECTION_STRING cannot be combined with a Cloud SQL instance: " +
+			"the connection string for Cloud SQL is synthesized to reach the proxy sidecar. Unset one of them, " +
+			"or use hack/install-ate.sh to reach an instance some other way")
 	}
 	return nil
 }

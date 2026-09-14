@@ -40,6 +40,10 @@ type Config struct {
 
 	BucketName string
 
+	// CloudSQLEnabled opts bootstrap into provisioning the Cloud SQL instance
+	// that backs the ateapi store. `create cloudsql` needs no such toggle:
+	// running it is the request.
+	CloudSQLEnabled   bool
 	CloudSQLInstance  string
 	CloudSQLTier      string
 	CloudSQLEdition   string

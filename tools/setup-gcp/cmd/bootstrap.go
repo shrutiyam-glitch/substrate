@@ -15,16 +15,54 @@
 package cmd
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/spf13/cobra"
 )
 
+// bootstrapStep is one unit of the bootstrap sequence, named for the progress
+// log it prints.
+type bootstrapStep struct {
+	name string
+	run  func(context.Context, *Config) error
+}
+
+// bootstrapSteps returns the sequence to run, in order.
+//
+// Cloud SQL is opt-in: it bills by the hour and needs private services access
+// on the VPC, so a plain bootstrap leaves ateapi on the in-cluster PostgreSQL
+// StatefulSet the installer bundles. When it is asked for it follows the
+// cluster, because its Workload Identity binding names the pool that step
+// enables, and it precedes everything else because creating an instance is the
+// long pole.
+func bootstrapSteps(cfg *Config) []bootstrapStep {
+	steps := []bootstrapStep{
+		{"Enabling required APIs", enableRequiredAPIs},
+		{"Creating GKE Cluster", createClusterIdempotent},
+	}
+	if cfg.CloudSQLEnabled {
+		steps = append(steps, bootstrapStep{"Creating Cloud SQL instance for the ateapi store", provisionCloudSQL})
+	}
+	return append(steps,
+		bootstrapStep{"Creating GCS Bucket for snapshots", createSnapshotBucket},
+		bootstrapStep{"Granting GKE Node permissions", grantGkeNodePermissions},
+		bootstrapStep{"Granting Atelet permissions", grantAteletPermissions},
+		bootstrapStep{"Creating IAM policy bindings for bucket", createIamPolicyBindings},
+		bootstrapStep{"Creating Monitoring Dashboards", createMonitoringDashboards},
+	)
+}
+
 var bootstrapCmd = &cobra.Command{
 	Use:   "bootstrap",
 	Short: "Fully bootstrap the GCP environment",
-	Long:  `Runs all setup steps in order: enable APIs, create cluster, create bucket, grant IAM permissions, and create dashboards.`,
+	Long: `Runs all setup steps in order: enable APIs, create cluster, create bucket, grant IAM permissions, and create dashboards.
+
+Pass --cloudsql to also provision the Cloud SQL PostgreSQL instance that backs
+the ateapi store, in --region. Without it, ateapi runs against the in-cluster
+PostgreSQL StatefulSet the installer bundles. See cloud-sql.md.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 		if err := resolveProjectID(ctx, &cfg); err != nil {
@@ -33,45 +71,32 @@ var bootstrapCmd = &cobra.Command{
 		if cfg.BucketName == "" {
 			return errors.New("--bucket-name is required")
 		}
+		// Settings are validated up front because the Cloud SQL step runs
+		// after the cluster: left to the step itself, a rejected
+		// --cloudsql-edition would surface once a cluster already exists.
+		if cfg.CloudSQLEnabled {
+			if _, err := cloudSQLInstanceSpec(&cfg); err != nil {
+				return err
+			}
+		}
 
 		slog.Info("Starting full bootstrap...")
 
-		slog.Info("Step 1/7: Enabling required APIs...")
-		if err := enableRequiredAPIs(ctx, &cfg); err != nil {
-			return err
-		}
-
-		slog.Info("Step 2/7: Creating GKE Cluster...")
-		if err := createClusterIdempotent(ctx, &cfg); err != nil {
-			return err
-		}
-
-		slog.Info("Step 3/7: Creating GCS Bucket for snapshots...")
-		if err := createSnapshotBucket(ctx, &cfg); err != nil {
-			return err
-		}
-
-		slog.Info("Step 4/7: Granting GKE Node permissions...")
-		if err := grantGkeNodePermissions(ctx, &cfg); err != nil {
-			return err
-		}
-
-		slog.Info("Step 5/7: Granting Atelet permissions...")
-		if err := grantAteletPermissions(ctx, &cfg); err != nil {
-			return err
-		}
-
-		slog.Info("Step 6/7: Creating IAM policy bindings for bucket...")
-		if err := createIamPolicyBindings(ctx, &cfg); err != nil {
-			return err
-		}
-
-		slog.Info("Step 7/7: Creating Monitoring Dashboards...")
-		if err := createMonitoringDashboards(ctx, &cfg); err != nil {
-			return err
+		// The Cloud SQL instance is created in --region, and the cluster step
+		// rejects a --cluster-location outside it, so the two cannot land in
+		// different regions without an error first.
+		steps := bootstrapSteps(&cfg)
+		for i, step := range steps {
+			slog.Info(fmt.Sprintf("Step %d/%d: %s...", i+1, len(steps), step.name))
+			if err := step.run(ctx, &cfg); err != nil {
+				return err
+			}
 		}
 
 		slog.Info("Bootstrap completed successfully.")
+		if cfg.CloudSQLEnabled {
+			printCloudSQLNextSteps(&cfg)
+		}
 		return nil
 	},
 }
@@ -91,4 +116,7 @@ func init() {
 	bootstrapCmd.Flags().StringVar(&cfg.BootDiskType, "boot-disk-type", getEnv("BOOT_DISK_TYPE", ""), "Boot disk type for the node pool; empty = GKE default [env: BOOT_DISK_TYPE]")
 	bootstrapCmd.Flags().StringVar(&cfg.BucketName, "bucket-name", getEnv("BUCKET_NAME", ""), "Name of the GCS bucket for snapshots [env: BUCKET_NAME]")
 	bootstrapCmd.Flags().StringVar(&cfg.DashboardDir, "dashboard-dir", getEnv("DASHBOARD_DIR", "tools/setup-gcp/dashboards"), "Directory containing dashboard JSON files [env: DASHBOARD_DIR]")
+
+	bootstrapCmd.Flags().BoolVar(&cfg.CloudSQLEnabled, "cloudsql", getEnv("CLOUDSQL_ENABLED", false), "Also provision the Cloud SQL PostgreSQL instance backing the ateapi store, in --region (see cloud-sql.md) [env: CLOUDSQL_ENABLED]")
+	registerCloudSQLFlags(bootstrapCmd, "cloudsql-")
 }

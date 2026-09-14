@@ -73,6 +73,14 @@ type Env struct {
 	// suffix; see SubstrateVersion.
 	substrateVersion       string
 	substrateVersionSuffix string
+
+	// cloudSQL caches the resolved Cloud SQL configuration. Resolving it can
+	// read the cluster, and several steps need the same answer; see CloudSQL.
+	cloudSQL *config.CloudSQL
+
+	// apiServerEnvHash is set by CreateAPIServerEnvVars and read by the apply
+	// that follows it; see setEnvHashAnnotation.
+	apiServerEnvHash string
 }
 
 // NewEnv connects to the cluster described by cfg.

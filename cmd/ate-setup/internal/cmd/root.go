@@ -52,6 +52,10 @@ is present (skipped for --kind, and by NO_DEV_ENV=1).`,
 		if cmd.Flags().Changed("podcert-workers-per-signer") && opts.PodcertWorkersPerSigner < 1 {
 			return fmt.Errorf("--podcert-workers-per-signer must be a positive integer, got %d", opts.PodcertWorkersPerSigner)
 		}
+		// Passing --cloudsql-instance empty means "move the store back to the
+		// bundled database"; not passing it at all means "leave the store
+		// where it is". Only cobra can tell the two apart.
+		opts.CloudSQLNamed = cmd.Flags().Changed("cloudsql-instance")
 		// Commands that touch neither config nor cluster (help, version,
 		// completion) opt out by way of not being run through this path.
 		cfg, err := config.Load(opts)
@@ -99,6 +103,12 @@ func init() {
 		"Install pre-built images from this registry path instead of building them from source (e.g. registry.example.com/substrate)")
 	f.StringVar(&opts.ImageTag, "image-tag", "",
 		"Tag the pre-built images carry (required with --image-repo)")
+
+	f.StringVar(&opts.CloudSQLInstance, "cloudsql-instance", "",
+		"Back the store with this Cloud SQL instance, named project:region:instance, instead of the bundled PostgreSQL "+
+			"(defaults to ATE_API_POSTGRES_CLOUDSQL_INSTANCE; pass it empty to move back to the bundled database)")
+	f.StringVar(&opts.CloudSQLGSA, "cloudsql-gsa", "",
+		"Service account that is the Cloud SQL instance's IAM database user (defaults to ATE_API_POSTGRES_CLOUDSQL_GSA)")
 
 	// Cobra's default completion command would run PersistentPreRunE and
 	// require a cluster; the tree is not deep enough to justify that.

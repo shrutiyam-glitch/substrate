@@ -37,6 +37,7 @@ const (
 	SecretServiceDNSCA     = "service-dns-ca-pool"
 	SecretPodIdentityCA    = "pod-identity-ca-pool"
 	SecretEgressMITMCAPool = "egress-mitm-ca-pool"
+	SecretAPIEnvVars       = "ate-api-server-secret-envvars"
 	ConfigMapAPIEnvVars    = "ate-api-server-envvars"
 	ConfigMapAPIAuthn      = "ate-api-authentication"
 	// poolKeyID is the identifier given to the first CA and JWT key in a new
@@ -119,24 +120,44 @@ func (e *Env) CreateActorIDCACertsSecret(ctx context.Context) error {
 	})
 }
 
-// CreateAPIServerEnvVars writes the ConfigMap that tells ate-api-server how to
-// reach its PostgreSQL store. ate-api-server.yaml pulls it in via an optional
-// envFrom and resolves --postgres-connection-string=@env and
-// --postgres-schema=@env from it.
+// CreateAPIServerEnvVars writes what tells ate-api-server how to reach its
+// PostgreSQL store: the connection string and schema that
+// --postgres-connection-string=@env and --postgres-schema=@env resolve from,
+// and, when the store is Cloud SQL, the settings its proxy sidecar reads.
+//
+// The two land in different objects because ate-api-server.yaml pulls the
+// Secret in after the ConfigMap, so the Secret is what an environment variable
+// present in both ends up as. The connection string can carry a password, and
+// writing it anywhere else leaves a stale Secret from an earlier install
+// quietly winning.
 func (e *Env) CreateAPIServerEnvVars(ctx context.Context) error {
 	log.Step("create_api_server_env_vars")
 	if err := e.Kube.EnsureNamespace(ctx, NamespaceAteSystem); err != nil {
 		return err
 	}
 
-	connString := e.Cfg.PostgresConnString()
-	log.Infof("POSTGRES_CONNECTION_STRING: %s", connString)
+	cloudSQL, err := e.CloudSQL(ctx)
+	if err != nil {
+		return err
+	}
 
-	return e.Kube.ApplyConfigMap(ctx, NamespaceAteSystem, ConfigMapAPIEnvVars,
-		buildAPIServerEnvVars(connString, e.Cfg.PostgresSchemaName()))
+	connString := e.Cfg.PostgresConnString()
+	if cloudSQL.Enabled() {
+		connString = cloudSQL.DSN()
+	}
+	log.Infof("POSTGRES_CONNECTION_STRING: %s", redactDSNPassword(connString))
+
+	proxySettings := cloudSQLEnvVars(cloudSQL)
+	connSettings := buildAPIServerEnvVars(connString, e.Cfg.PostgresSchemaName())
+	e.apiServerEnvHash = apiServerEnvHash(proxySettings, connSettings)
+
+	if err := e.Kube.ApplyConfigMap(ctx, NamespaceAteSystem, ConfigMapAPIEnvVars, proxySettings); err != nil {
+		return err
+	}
+	return e.Kube.ApplySecret(ctx, NamespaceAteSystem, SecretAPIEnvVars, connSettings)
 }
 
-// buildAPIServerEnvVars is the ConfigMap payload. ate-api-server takes the
+// buildAPIServerEnvVars is the Secret payload. ate-api-server takes the
 // connection string and the schema from it, and exits on an empty schema; an
 // unrecognized key here reaches the container as a stray environment variable,
 // so the set stays exactly what the shell installer's
@@ -146,6 +167,20 @@ func buildAPIServerEnvVars(connString, schema string) map[string]string {
 		"ATE_API_POSTGRES_CONNECTION_STRING": connString,
 		"ATE_API_POSTGRES_SCHEMA":            schema,
 	}
+}
+
+// redactDSNPassword hides the password in a libpq connection string so that
+// logs, which are routinely pasted into bug reports, do not carry it. Only the
+// keyword/value form needs handling: that is what ate-setup writes and what
+// .ate-dev-env.sh is documented to set.
+func redactDSNPassword(dsn string) string {
+	fields := strings.Fields(dsn)
+	for i, field := range fields {
+		if strings.HasPrefix(field, "password=") {
+			fields[i] = "password=<redacted>"
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 // CreateAPIAuthenticationConfig writes the default ate-api-server

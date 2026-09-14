@@ -98,6 +98,22 @@ func enableCloudSQLAPIs(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
+// servicenetworkingParent is the service that owns private services access
+// peerings; every connection under it belongs to Google's service producers.
+const servicenetworkingParent = "services/servicenetworking.googleapis.com"
+
+// hasReservedPeeringRange reports whether the VPC already exports a range to
+// the service producers, which is all Cloud SQL private IP needs from it. Any
+// connection will do: the range is shared by every producer on the network.
+func hasReservedPeeringRange(conns []*servicenetworking.Connection) bool {
+	for _, conn := range conns {
+		if len(conn.ReservedPeeringRanges) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // checkPrivateServicesAccess verifies the VPC has a private services access
 // peering, which Cloud SQL private IP requires. Allocating the range and
 // peering is a rare one-time-per-VPC operation left to gcloud.
@@ -106,9 +122,9 @@ func checkPrivateServicesAccess(ctx context.Context, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("create servicenetworking client: %w", err)
 	}
-	resp, err := svc.Services.Connections.List("services/servicenetworking.googleapis.com").
+	resp, err := svc.Services.Connections.List(servicenetworkingParent).
 		Network(privateNetworkURL(cfg)).Context(ctx).Do()
-	if err == nil && len(resp.Connections) > 0 && len(resp.Connections[0].ReservedPeeringRanges) > 0 {
+	if err == nil && hasReservedPeeringRange(resp.Connections) {
 		return nil
 	}
 	if err != nil {
@@ -227,7 +243,7 @@ func cloudSQLInstanceSpec(cfg *Config) (*sqladmin.DatabaseInstance, error) {
 		settings.Edition = "ENTERPRISE_PLUS"
 		settings.DataCacheConfig = &sqladmin.DataCacheConfig{DataCacheEnabled: true}
 	default:
-		return nil, fmt.Errorf("unknown --edition %q (want enterprise|enterprise-plus)", cfg.CloudSQLEdition)
+		return nil, fmt.Errorf("unknown Cloud SQL edition %q (want enterprise|enterprise-plus)", cfg.CloudSQLEdition)
 	}
 	// 0 leaves the Cloud SQL default (10 GB, auto-resizing). PD IOPS and
 	// throughput scale with provisioned size, so benchmarks and production
@@ -395,24 +411,52 @@ func createCloudSQLIAMUser(ctx context.Context, svc *sqladmin.Service, cfg *Conf
 
 func printCloudSQLNextSteps(cfg *Config) {
 	gsa := cloudSQLGSAEmail(cfg)
-	dbUser := cloudSQLDatabaseUser(gsa)
 	fmt.Printf(`
-Cloud SQL is provisioned. Two steps remain:
+Cloud SQL is provisioned. One step remains -- deploy ateapi against it:
 
-1. One-time schema privileges (PostgreSQL 15+ removed PUBLIC's CREATE on the
-   public schema; ateapi applies its schema at startup as the IAM user).
-   Connect as the postgres user and run:
+  export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=%s:%s:%s
+  export ATE_API_POSTGRES_CLOUDSQL_GSA=%s
+  go run ./cmd/ate-setup deploy ate-system
 
-     GRANT USAGE, CREATE ON SCHEMA public TO "%s";
+Or pass them as flags, without exporting anything:
 
-2. Deploy ateapi against it:
-
-     export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=%s:%s:%s
-     export ATE_API_POSTGRES_CLOUDSQL_GSA=%s
-     ./hack/install-ate.sh --deploy-ate-system
+  go run ./cmd/ate-setup deploy ate-system \
+    --cloudsql-instance=%[1]s:%[2]s:%[3]s --cloudsql-gsa=%[4]s
 
 See tools/setup-gcp/cloud-sql.md for details and verification steps.
-`, dbUser, cfg.ProjectID, cfg.Region, cfg.CloudSQLInstance, gsa)
+`, cfg.ProjectID, cfg.Region, cfg.CloudSQLInstance, gsa)
+}
+
+// provisionCloudSQL creates the instance, the database, and the identity
+// ateapi logs in with. Shared by `create cloudsql` and `bootstrap --cloudsql`.
+// Every step reconciles rather than fails on a resource that already exists,
+// so the whole sequence is safe to rerun.
+func provisionCloudSQL(ctx context.Context, cfg *Config) error {
+	if err := enableCloudSQLAPIs(ctx, cfg); err != nil {
+		return err
+	}
+	svc, err := sqladmin.NewService(ctx)
+	if err != nil {
+		return fmt.Errorf("create sqladmin client: %w", err)
+	}
+	if err := createCloudSQLInstance(ctx, svc, cfg); err != nil {
+		return err
+	}
+	if err := createCloudSQLDatabase(ctx, svc, cfg); err != nil {
+		return err
+	}
+	if err := createCloudSQLGSA(ctx, cfg); err != nil {
+		return err
+	}
+	if err := grantCloudSQLProjectRoles(ctx, cfg); err != nil {
+		return err
+	}
+	if err := createCloudSQLIAMUser(ctx, svc, cfg); err != nil {
+		return err
+	}
+	// Last: it grants to the user created above, and it is the only step that
+	// needs the cluster rather than the project.
+	return grantCloudSQLSchemaPrivileges(ctx, svc, cfg)
 }
 
 var cloudsqlCmd = &cobra.Command{
@@ -427,26 +471,7 @@ var cloudsqlCmd = &cobra.Command{
 		if !cmd.Flags().Changed("region") && os.Getenv("GCE_REGION") == "" {
 			return errors.New("--region is required (or set GCE_REGION): the instance must be in the cluster's region")
 		}
-		if err := enableCloudSQLAPIs(ctx, &cfg); err != nil {
-			return err
-		}
-		svc, err := sqladmin.NewService(ctx)
-		if err != nil {
-			return fmt.Errorf("create sqladmin client: %w", err)
-		}
-		if err := createCloudSQLInstance(ctx, svc, &cfg); err != nil {
-			return err
-		}
-		if err := createCloudSQLDatabase(ctx, svc, &cfg); err != nil {
-			return err
-		}
-		if err := createCloudSQLGSA(ctx, &cfg); err != nil {
-			return err
-		}
-		if err := grantCloudSQLProjectRoles(ctx, &cfg); err != nil {
-			return err
-		}
-		if err := createCloudSQLIAMUser(ctx, svc, &cfg); err != nil {
+		if err := provisionCloudSQL(ctx, &cfg); err != nil {
 			return err
 		}
 		printCloudSQLNextSteps(&cfg)
@@ -454,12 +479,28 @@ var cloudsqlCmd = &cobra.Command{
 	},
 }
 
+// registerCloudSQLFlags binds the Cloud SQL settings onto cmd. `create
+// cloudsql` takes them unprefixed, where the command name supplies the
+// context; `bootstrap` passes "cloudsql-", where a bare --instance or --tier
+// would read as the cluster's.
+func registerCloudSQLFlags(cmd *cobra.Command, prefix string) {
+	f := cmd.Flags()
+	f.StringVar(&cfg.CloudSQLInstance, prefix+"instance", getEnv("CLOUDSQL_INSTANCE", "atepg"), "Cloud SQL instance name [env: CLOUDSQL_INSTANCE]")
+	f.StringVar(&cfg.CloudSQLTier, prefix+"tier", getEnv("CLOUDSQL_TIER", "db-custom-2-8192"), "Machine tier: db-custom-<vCPU>-<MB> for enterprise, db-perf-optimized-N-<vCPU> for enterprise-plus [env: CLOUDSQL_TIER]")
+	f.StringVar(&cfg.CloudSQLEdition, prefix+"edition", getEnv("CLOUDSQL_EDITION", "enterprise"), "Instance edition: enterprise | enterprise-plus (enables the local-SSD data cache) [env: CLOUDSQL_EDITION]")
+	f.Int64Var(&cfg.CloudSQLStorageGB, prefix+"storage-size", getEnv("CLOUDSQL_STORAGE_GB", int64(0)), "Data disk size in GB; 0 = Cloud SQL default (10 GB, auto-resizing). PD IOPS scale with size [env: CLOUDSQL_STORAGE_GB]")
+	f.StringVar(&cfg.CloudSQLGSAName, prefix+"gsa-name", getEnv("CLOUDSQL_GSA_NAME", "ate-api-server"), "Name of the Google service account to create for Workload Identity + IAM database auth [env: CLOUDSQL_GSA_NAME]")
+}
+
 func init() {
 	createCmd.AddCommand(cloudsqlCmd)
-	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLInstance, "instance", getEnv("CLOUDSQL_INSTANCE", "atepg"), "Cloud SQL instance name [env: CLOUDSQL_INSTANCE]")
-	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLTier, "tier", getEnv("CLOUDSQL_TIER", "db-custom-2-8192"), "Machine tier: db-custom-<vCPU>-<MB> for enterprise, db-perf-optimized-N-<vCPU> for enterprise-plus [env: CLOUDSQL_TIER]")
-	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLEdition, "edition", getEnv("CLOUDSQL_EDITION", "enterprise"), "Instance edition: enterprise | enterprise-plus (enables the local-SSD data cache) [env: CLOUDSQL_EDITION]")
-	cloudsqlCmd.Flags().Int64Var(&cfg.CloudSQLStorageGB, "storage-size", getEnv("CLOUDSQL_STORAGE_GB", int64(0)), "Data disk size in GB; 0 = Cloud SQL default (10 GB, auto-resizing). PD IOPS scale with size [env: CLOUDSQL_STORAGE_GB]")
-	cloudsqlCmd.Flags().StringVar(&cfg.CloudSQLGSAName, "gsa-name", getEnv("CLOUDSQL_GSA_NAME", "ate-api-server"), "Name of the Google service account to create for Workload Identity + IAM database auth [env: CLOUDSQL_GSA_NAME]")
-	cloudsqlCmd.Flags().StringVar(&cfg.Network, "network", getEnv("NETWORK", "default"), "VPC network name (must match the cluster's) [env: NETWORK]")
+	registerCloudSQLFlags(cloudsqlCmd, "")
+	// Not in registerCloudSQLFlags: bootstrap declares these itself, for the
+	// cluster and this instance both.
+	f := cloudsqlCmd.Flags()
+	f.StringVar(&cfg.Network, "network", getEnv("NETWORK", "default"), "VPC network name (must match the cluster's) [env: NETWORK]")
+	// The schema grants run as a Job on the cluster, the only place with a
+	// route to a private-IP instance.
+	f.StringVar(&cfg.ClusterName, "cluster-name", getEnv("CLUSTER_NAME", "substrate-poc"), "Cluster to run the schema grants from [env: CLUSTER_NAME]")
+	f.StringVar(&cfg.ClusterLocation, "cluster-location", getEnv("CLUSTER_LOCATION", "us-west1-c"), "Zone or region of that cluster [env: CLUSTER_LOCATION]")
 }

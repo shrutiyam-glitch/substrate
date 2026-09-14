@@ -26,18 +26,33 @@ func TestUseBundledPostgres(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		connString string
+		cloudSQL   config.CloudSQL
 		want       bool
 	}{
-		{name: "no external database", connString: "", want: true},
+		{name: "no external database", want: true},
 		{
 			name:       "external database configured",
 			connString: "postgresql://user@db.example.com:5432/atepg",
 			want:       false,
 		},
+		{
+			name:     "cloud sql configured",
+			cloudSQL: config.CloudSQL{Instance: "p:us-central1:ate", GSA: "ate@p.iam.gserviceaccount.com"},
+			want:     false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e := &Env{Cfg: &config.Config{PostgresConnectionString: tc.connString}}
-			if got := e.useBundledPostgres(); got != tc.want {
+			// Seeded rather than named on Cfg so that the unnamed case does
+			// not go looking for a cluster to adopt from.
+			e := &Env{
+				Cfg:      &config.Config{PostgresConnectionString: tc.connString},
+				cloudSQL: &tc.cloudSQL,
+			}
+			got, err := e.useBundledPostgres(t.Context())
+			if err != nil {
+				t.Fatalf("useBundledPostgres() error = %v", err)
+			}
+			if got != tc.want {
 				t.Errorf("useBundledPostgres() = %v, want %v", got, tc.want)
 			}
 		})
