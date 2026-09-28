@@ -33,6 +33,7 @@ import (
 
 	"sync"
 
+	"github.com/agent-substrate/substrate/cmd/atelet/internal/apivalidation"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ategcs"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/sparsefile"
@@ -800,7 +801,7 @@ func shouldHaveSnapshots(req *ateletpb.CheckpointRequest) bool {
 	}
 
 	for _, vol := range req.GetSpec().GetVolumes() {
-		if _, ok := vol.GetSource().(*ateletpb.Volume_DurableDir); ok {
+		if vol.GetDurableDir() != nil {
 			return true
 		}
 	}
@@ -1302,8 +1303,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 // Terminate terminates any running workload on ateom, unmounts external volumes,
 // and resets actor directories on the node.
 func (s *AteomHerder) Terminate(ctx context.Context, req *ateletpb.TerminateRequest) (*ateletpb.TerminateResponse, error) {
-	if err := validateTerminateRequest(req); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	if err := apivalidation.ValidateTerminateRequest(ctx, req); err != nil {
+		return nil, err
 	}
 
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
@@ -1542,8 +1543,7 @@ func (s *AteomHerder) prepareOCIBundles(
 ) error {
 	// Prepare host folders for volume types that need them.
 	for _, vol := range spec.GetVolumes() {
-		switch vol.GetSource().(type) {
-		case *ateletpb.Volume_DurableDir:
+		if vol.GetDurableDir() != nil {
 			volPath := ateletpath.DurableDirVolumeMountPoint(actorUID, vol.GetName())
 			if err := os.MkdirAll(volPath, 0o700); err != nil {
 				return fmt.Errorf("while creating %q: %w", volPath, err)
@@ -1642,29 +1642,29 @@ func buildAteomWorkloadSpec(spec *ateletpb.WorkloadSpec) (*ateompb.WorkloadSpec,
 				return nil, fmt.Errorf("container %q mounts volume %q which is not defined in workload volumes", ctr.GetName(), volName)
 			}
 
-			switch vol.GetSource().(type) {
-			case *ateletpb.Volume_DurableDir:
+			switch {
+			case vol.GetDurableDir() != nil:
 				ddMounts = append(ddMounts, &ateompb.DurableDirVolumeMount{
 					VolumeName: volName,
 					MountPath:  vm.GetMountPath(),
 				})
-			case *ateletpb.Volume_External:
+			case vol.GetExternal() != nil:
 				csiMounts = append(csiMounts, &ateompb.VolumeMount{
 					VolumeName: volName,
 					MountPath:  vm.GetMountPath(),
 				})
-			case *ateletpb.Volume_SystemInfo:
+			case vol.GetSystemInfo() != nil:
 				siMounts = append(siMounts, &ateompb.SystemInfoVolumeMount{
 					VolumeName: volName,
 					MountPath:  vm.GetMountPath(),
 				})
-			case *ateletpb.Volume_Image:
+			case vol.GetImage() != nil:
 				imgMounts = append(imgMounts, &ateompb.ImageVolumeMount{
 					VolumeName: volName,
 					MountPath:  vm.GetMountPath(),
 				})
 			default:
-				return nil, fmt.Errorf("container %q mounts volume %q with unsupported source %T", ctr.GetName(), volName, vol.GetSource())
+				return nil, fmt.Errorf("container %q mounts volume %q with no source set", ctr.GetName(), volName)
 			}
 		}
 		out.Containers = append(out.Containers, &ateompb.Container{
@@ -1880,24 +1880,6 @@ func validateRestoreRequest(req *ateletpb.RestoreRequest) error {
 		return fmt.Errorf("base_config is only valid with snapshot scope %s", ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA_ON_GOLDEN)
 	}
 	return nil
-}
-
-func validateTerminateRequest(req *ateletpb.TerminateRequest) error {
-	var errs field.ErrorList
-	errs = append(errs, resources.ValidateResourceName(req.GetAtespace(), field.NewPath("atespace"))...)
-	errs = append(errs, resources.ValidateResourceName(req.GetActorName(), field.NewPath("actor_name"))...)
-	errs = append(errs, resources.ValidateResourceName(req.GetActorUid(), field.NewPath("actor_uid"))...)
-	if len(errs) > 0 {
-		return errs.ToAggregate()
-	}
-	if err := resources.ValidateAteomUID(req.GetTargetAteomUid()); err != nil {
-		return err
-	}
-	names := make([]string, 0, len(req.GetSpec().GetContainers()))
-	for _, ctr := range req.GetSpec().GetContainers() {
-		names = append(names, ctr.GetName())
-	}
-	return resources.ValidateContainerNames(names)
 }
 
 func validateSnapshotScope(scope ateletpb.SnapshotScope) error {
