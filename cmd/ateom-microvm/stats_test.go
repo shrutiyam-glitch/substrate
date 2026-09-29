@@ -52,13 +52,13 @@ func TestActorBootParamsAttribution(t *testing.T) {
 			name: "fully populated",
 			p: actorBootParams{
 				actorRef:         resources.ActorRef{Atespace: "atespace-a", Name: "actor-b"},
-				actorUID:         "uid-c",
+				actorUID:         "cccccccc-0000-4000-8000-000000000003",
 				templateAtespace: "template-ns-d",
 				templateName:     "template-name-e",
 			},
 			want: resources.ActorAttribution{
 				Ref:              resources.ActorRef{Atespace: "atespace-a", Name: "actor-b"},
-				UID:              "uid-c",
+				UID:              "cccccccc-0000-4000-8000-000000000003",
 				TemplateAtespace: "template-ns-d",
 				TemplateName:     "template-name-e",
 			},
@@ -88,7 +88,7 @@ func TestActorBootParamsAttributionMatchesRequest(t *testing.T) {
 	req := &ateompb.RunWorkloadRequest{
 		Atespace:              "atespace-a",
 		ActorName:             "actor-b",
-		ActorUid:              "uid-c",
+		ActorUid:              "cccccccc-0000-4000-8000-000000000003",
 		ActorTemplateAtespace: "template-ns-d",
 		ActorTemplateName:     "template-name-e",
 	}
@@ -113,7 +113,7 @@ func TestActorBootParamsAttributionMatchesRequest(t *testing.T) {
 
 var testActor = resources.ActorAttribution{
 	Ref:              resources.ActorRef{Atespace: "space-a", Name: "actor-a"},
-	UID:              "uid-a",
+	UID:              "aaaaaaaa-0000-4000-8000-000000000001",
 	TemplateAtespace: "ns-a",
 	TemplateName:     "template-a",
 }
@@ -200,7 +200,7 @@ func TestGetWorkloadStats(t *testing.T) {
 	s := newStatsService(agent, "app_ovl")
 
 	before := time.Now().UnixNano()
-	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	after := time.Now().UnixNano()
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
@@ -215,7 +215,7 @@ func TestGetWorkloadStats(t *testing.T) {
 	want := &ateompb.GetWorkloadStatsResponse{Sample: &ateompb.WorkloadStatsSample{
 		Atespace:              "space-a",
 		ActorName:             "actor-a",
-		ActorUid:              "uid-a",
+		ActorUid:              "aaaaaaaa-0000-4000-8000-000000000001",
 		ActorTemplateAtespace: "ns-a",
 		ActorTemplateName:     "template-a",
 		SandboxClass:          ateompb.SandboxClass_SANDBOX_CLASS_MICROVM,
@@ -247,7 +247,7 @@ func TestGetWorkloadStatsSumsContainers(t *testing.T) {
 	}}
 	s := newStatsService(agent, "app_ovl", "sidecar_ovl")
 
-	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
 	}
@@ -284,7 +284,7 @@ func TestGetWorkloadStatsSkipsUnreadableContainer(t *testing.T) {
 	}
 	s := newStatsService(agent, "app_ovl", "exited_ovl")
 
-	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
 	}
@@ -303,7 +303,7 @@ func TestGetWorkloadStatsCountsAnsweredContainer(t *testing.T) {
 	agent := &fakeAgent{stats: map[string]*agentpb.CgroupStats{"app_ovl": nil}}
 	s := newStatsService(agent, "app_ovl")
 
-	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
 	}
@@ -332,11 +332,19 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			want:     codes.InvalidArgument,
 		},
 		{
+			// Declarative validation also holds the uid to its format, which the
+			// hand-written check it replaced never did.
+			name:     "malformed actor_uid",
+			service:  func() *AteomService { return newStatsService(healthy, "app_ovl") },
+			actorUID: "not-a-uuid",
+			want:     codes.InvalidArgument,
+		},
+		{
 			// Not here at all. NOT_FOUND rather than FAILED_PRECONDITION, because
 			// what the caller should do about it is re-resolve, not retry.
 			name:     "ateom is available",
 			service:  func() *AteomService { return &AteomService{} },
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.NotFound,
 		},
 		{
@@ -345,7 +353,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			// another's name, and it is the same "not here" as the case above.
 			name:     "actor_uid does not match the executing workload",
 			service:  func() *AteomService { return newStatsService(healthy, "app_ovl") },
-			actorUID: "uid-b",
+			actorUID: "bbbbbbbb-0000-4000-8000-000000000002",
 			want:     codes.NotFound,
 		},
 		{
@@ -358,7 +366,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 				hostTestActor(s, testActor, nil)
 				return s
 			},
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.FailedPrecondition,
 		},
 		{
@@ -368,10 +376,10 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			name: "guest agent connection belongs to another actor",
 			service: func() *AteomService {
 				s := newStatsService(healthy, "app_ovl")
-				hostTestActor(s, testActor, &guestStatsTarget{actorUID: "uid-b", agent: healthy, workloadIDs: []string{"app_ovl"}})
+				hostTestActor(s, testActor, &guestStatsTarget{actorUID: "bbbbbbbb-0000-4000-8000-000000000002", agent: healthy, workloadIDs: []string{"app_ovl"}})
 				return s
 			},
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.Internal,
 		},
 		{
@@ -388,7 +396,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 				}}
 				return newStatsService(agent, "app_ovl", "sidecar_ovl")
 			},
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.FailedPrecondition,
 		},
 		{
@@ -396,7 +404,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			// confident zero would be reporting a state we do not understand.
 			name:     "no containers to measure",
 			service:  func() *AteomService { return newStatsService(healthy) },
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.FailedPrecondition,
 		},
 	} {
@@ -425,7 +433,7 @@ func TestGetWorkloadStatsDoesNotTakeLock(t *testing.T) {
 	}
 	defer s.locks.Unlock(testActor.UID)
 
-	if _, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"}); err != nil {
+	if _, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"}); err != nil {
 		t.Errorf("GetWorkloadStats() error = %v, want nil", err)
 	}
 }
@@ -462,7 +470,7 @@ func TestGetActiveWorkloadStats(t *testing.T) {
 	// The keyed read against the same fake is the reference: the discovery read
 	// must produce the identical sample, since both are the same measurement
 	// with a different addressing mode.
-	want, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	want, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
 	}
@@ -530,7 +538,7 @@ func TestGetActiveWorkloadStatsBooting(t *testing.T) {
 
 func TestGetActiveWorkloadStatsSeveralActors(t *testing.T) {
 	second := testActor
-	second.UID = "uid-b"
+	second.UID = "bbbbbbbb-0000-4000-8000-000000000002"
 	second.Ref.Name = "actor-b"
 
 	agent := &fakeAgent{stats: map[string]*agentpb.CgroupStats{
@@ -565,7 +573,7 @@ func TestGetActiveWorkloadStatsSeveralActors(t *testing.T) {
 // pending entry alongside their samples.
 func TestGetActiveWorkloadStatsOneBooting(t *testing.T) {
 	booting := testActor
-	booting.UID = "uid-b"
+	booting.UID = "bbbbbbbb-0000-4000-8000-000000000002"
 
 	agent := &fakeAgent{stats: map[string]*agentpb.CgroupStats{
 		"app_ovl": containerStats(1000, 2000, 100, 5000),
@@ -598,7 +606,7 @@ func TestGetWorkloadStatsTransition(t *testing.T) {
 	s := newStatsService(agent, "app_ovl")
 	agent.onCall = func() { unhostTestActor(s, testActor.UID) }
 
-	_, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	_, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if got := apierror.Code(err); got != codes.NotFound {
 		t.Errorf("GetWorkloadStats() during transition: code = %v, want %v (err: %v)", got, codes.NotFound, err)
 	}
@@ -612,7 +620,7 @@ func TestGetActiveWorkloadStatsStaleTarget(t *testing.T) {
 		"app_ovl": containerStats(1000, 2000, 100, 5000),
 	}}
 	s := newStatsService(agent, "app_ovl")
-	hostTestActor(s, testActor, &guestStatsTarget{actorUID: "uid-b", agent: agent, workloadIDs: []string{"app_ovl"}})
+	hostTestActor(s, testActor, &guestStatsTarget{actorUID: "bbbbbbbb-0000-4000-8000-000000000002", agent: agent, workloadIDs: []string{"app_ovl"}})
 
 	_, err := s.GetActiveWorkloadStats(context.Background(), &ateompb.GetActiveWorkloadStatsRequest{})
 	if got := apierror.Code(err); got != codes.Internal {
@@ -669,7 +677,7 @@ func TestGetActiveWorkloadStatsSamplesGuestsConcurrently(t *testing.T) {
 // activation they were read for.
 func TestGetActiveWorkloadStatsTransition(t *testing.T) {
 	otherActor := testActor
-	otherActor.UID = "uid-b"
+	otherActor.UID = "bbbbbbbb-0000-4000-8000-000000000002"
 	otherTemplate := testActor
 	otherTemplate.TemplateName = "template-b"
 

@@ -42,7 +42,7 @@ import (
 
 var testActor = resources.ActorAttribution{
 	Ref:              resources.ActorRef{Atespace: "space-a", Name: "actor-a"},
-	UID:              "uid-a",
+	UID:              "aaaaaaaa-0000-4000-8000-000000000001",
 	TemplateAtespace: "ns-a",
 	TemplateName:     "template-a",
 }
@@ -101,7 +101,7 @@ func TestGetWorkloadStats(t *testing.T) {
 	setHostedActor(s, &testActor)
 
 	before := time.Now().UnixNano()
-	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	got, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	after := time.Now().UnixNano()
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
@@ -116,7 +116,7 @@ func TestGetWorkloadStats(t *testing.T) {
 	want := &ateompb.GetWorkloadStatsResponse{Sample: &ateompb.WorkloadStatsSample{
 		Atespace:              "space-a",
 		ActorName:             "actor-a",
-		ActorUid:              "uid-a",
+		ActorUid:              "aaaaaaaa-0000-4000-8000-000000000001",
 		ActorTemplateAtespace: "ns-a",
 		ActorTemplateName:     "template-a",
 		SandboxClass:          ateompb.SandboxClass_SANDBOX_CLASS_GVISOR,
@@ -151,12 +151,21 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			want:     codes.InvalidArgument,
 		},
 		{
+			// Declarative validation also holds the uid to its format, which the
+			// hand-written check it replaced never did.
+			name:     "malformed actor_uid",
+			files:    healthyCgroup,
+			active:   &testActor,
+			actorUID: "not-a-uuid",
+			want:     codes.InvalidArgument,
+		},
+		{
 			// Not here at all. NOT_FOUND rather than FAILED_PRECONDITION, because
 			// what the caller should do about it is re-resolve, not retry.
 			name:     "ateom is available",
 			files:    healthyCgroup,
 			active:   nil,
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.NotFound,
 		},
 		{
@@ -166,7 +175,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			name:     "actor_uid does not match the executing workload",
 			files:    healthyCgroup,
 			active:   &testActor,
-			actorUID: "uid-b",
+			actorUID: "bbbbbbbb-0000-4000-8000-000000000002",
 			want:     codes.NotFound,
 		},
 		{
@@ -177,7 +186,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			name:     "no sandbox cgroup to measure",
 			files:    nil,
 			active:   &testActor,
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.FailedPrecondition,
 		},
 		{
@@ -186,7 +195,7 @@ func TestGetWorkloadStatsErrors(t *testing.T) {
 			name:     "sandbox cgroup is malformed",
 			files:    map[string]string{"memory.current": "max\n"},
 			active:   &testActor,
-			actorUID: "uid-a",
+			actorUID: "aaaaaaaa-0000-4000-8000-000000000001",
 			want:     codes.Internal,
 		},
 	} {
@@ -220,7 +229,7 @@ func TestGetWorkloadStatsDoesNotTakeLock(t *testing.T) {
 	}
 	defer s.locks.Unlock(testActor.UID)
 
-	if _, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"}); err != nil {
+	if _, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"}); err != nil {
 		t.Errorf("GetWorkloadStats() error = %v, want nil", err)
 	}
 }
@@ -250,7 +259,7 @@ func TestGetActiveWorkloadStats(t *testing.T) {
 	// The keyed read against the same fixture is the reference: the discovery
 	// read must produce the identical sample, since both are the same
 	// measurement with a different addressing mode.
-	want, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	want, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if err != nil {
 		t.Fatalf("GetWorkloadStats() error = %v, want nil", err)
 	}
@@ -325,7 +334,7 @@ func TestGetActiveWorkloadStatsBooting(t *testing.T) {
 // activation they were read for.
 func TestGetActiveWorkloadStatsTransition(t *testing.T) {
 	otherActor := testActor
-	otherActor.UID = "uid-b"
+	otherActor.UID = "bbbbbbbb-0000-4000-8000-000000000002"
 	otherTemplate := testActor
 	otherTemplate.TemplateName = "template-b"
 
@@ -377,7 +386,7 @@ func TestGetWorkloadStatsTransition(t *testing.T) {
 		return cgroupstats.Read(dir)
 	}
 
-	_, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "uid-a"})
+	_, err := s.GetWorkloadStats(context.Background(), &ateompb.GetWorkloadStatsRequest{ActorUid: "aaaaaaaa-0000-4000-8000-000000000001"})
 	if got := apierror.Code(err); got != codes.NotFound {
 		t.Errorf("GetWorkloadStats() during transition: code = %v, want %v (err: %v)", got, codes.NotFound, err)
 	}
@@ -385,7 +394,7 @@ func TestGetWorkloadStatsTransition(t *testing.T) {
 
 func TestGetActiveWorkloadStatsSeveralActors(t *testing.T) {
 	second := testActor
-	second.UID = "uid-b"
+	second.UID = "bbbbbbbb-0000-4000-8000-000000000002"
 
 	s := newStatsService(t, healthyCgroup)
 	// Give the second actor its own cgroup fixture.

@@ -28,6 +28,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/agentstats"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/third_party/kata/agentpb"
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/ateomvalidation"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
 )
@@ -95,8 +96,8 @@ type guestStatsTarget struct {
 // cold boot, snapshot, or restore; blocking there would silence the poller
 // through the phases whose usage matters most.
 func (s *AteomService) GetWorkloadStats(ctx context.Context, req *ateompb.GetWorkloadStatsRequest) (*ateompb.GetWorkloadStatsResponse, error) {
-	if req.GetActorUid() == "" {
-		return nil, apierror.InvalidArgument("actor_uid is required")
+	if err := ateomvalidation.ValidateGetWorkloadStatsRequest(ctx, req); err != nil {
+		return nil, err
 	}
 
 	// NOT_FOUND rather than FAILED_PRECONDITION: the requested actor is not
