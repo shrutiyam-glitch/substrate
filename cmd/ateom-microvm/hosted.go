@@ -65,9 +65,6 @@ func (s *AteomService) admitActor(attribution resources.ActorAttribution) (*host
 // hostActor sets up the actor's network, replacing any stale one.
 func (s *AteomService) hostActor(ctx context.Context, attribution resources.ActorAttribution) (*hostedActor, error) {
 	uid := attribution.UID
-	if uid == "" {
-		return nil, fmt.Errorf("actor UID is required")
-	}
 
 	hosted, stale, err := s.admitActor(attribution)
 	if err != nil {
