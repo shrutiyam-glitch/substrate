@@ -59,7 +59,6 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 var (
@@ -502,19 +501,8 @@ func containerNames(containers []*ateompb.Container) []string {
 	return names
 }
 
-// validateActorDirs rejects a request whose actor directories are unusable.
-func validateActorDirs(actorDirs *ateompb.ActorDirs) error {
-	if errs := resources.ValidateActorDirs(actorDirs, field.NewPath("actor_dirs")); len(errs) > 0 {
-		return apierror.InvalidArgument("%v", errs.ToAggregate())
-	}
-	return nil
-}
-
 func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkloadRequest) (resp *ateompb.RunWorkloadResponse, retErr error) {
 	if err := ateomvalidation.ValidateRunWorkloadRequest(ctx, req); err != nil {
-		return nil, err
-	}
-	if err := validateActorDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
@@ -635,9 +623,6 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 // (or the harness) to suspend on shutdown.
 func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) (*ateompb.CheckpointWorkloadResponse, error) {
 	if err := ateomvalidation.ValidateCheckpointWorkloadRequest(ctx, req); err != nil {
-		return nil, err
-	}
-	if err := validateActorDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
@@ -815,9 +800,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	if err := ateomvalidation.ValidateRestoreWorkloadRequest(ctx, req); err != nil {
 		return nil, err
 	}
-	if err := validateActorDirs(req.GetActorDirs()); err != nil {
-		return nil, err
-	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
 		return nil, fmt.Errorf("gave up waiting for the actor's lock: %w", ctx.Err())
 	}
@@ -965,9 +947,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 
 func (s *AteomService) TerminateWorkload(ctx context.Context, req *ateompb.TerminateWorkloadRequest) (*ateompb.TerminateWorkloadResponse, error) {
 	if err := ateomvalidation.ValidateTerminateWorkloadRequest(ctx, req); err != nil {
-		return nil, err
-	}
-	if err := validateActorDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {

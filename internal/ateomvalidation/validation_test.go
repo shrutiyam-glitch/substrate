@@ -26,10 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// Checkpoint is still gated optional with its message-typed fields opaque,
-// so nothing on it is rejected yet. Its test holds that line: an empty request
-// and a fully populated one both pass. The message-typed fields the other
-// requests require stay opaque too; their contents get rules in follow-ups.
+// Every request is validated; spec and egress_gateway are the message-typed
+// fields still opaque, and their contents get rules in follow-ups.
 
 func fullSpec() *ateompb.WorkloadSpec {
 	return &ateompb.WorkloadSpec{Containers: []*ateompb.Container{{
@@ -156,6 +154,10 @@ func TestValidateRunWorkloadRequest(t *testing.T) {
 		name: "missing actor_dirs",
 		obj:  valid(func(r *ateompb.RunWorkloadRequest) { r.ActorDirs = nil }),
 		want: field.ErrorList{field.Required(field.NewPath("actor_dirs"), "")},
+	}, {
+		name: "relative oci_bundle_dir",
+		obj:  valid(func(r *ateompb.RunWorkloadRequest) { r.ActorDirs.OciBundleDir = "bundles" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_dirs", "oci_bundle_dir"), nil, "")},
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -177,27 +179,168 @@ func TestValidateRunWorkloadRequestEdge(t *testing.T) {
 	}
 }
 
+func validCheckpointWorkloadRequest(mutate ...func(*ateompb.CheckpointWorkloadRequest)) *ateompb.CheckpointWorkloadRequest {
+	r := &ateompb.CheckpointWorkloadRequest{
+		Atespace:              "team-a",
+		ActorName:             "actor-1",
+		ActorUid:              "01234567-89ab-cdef-0123-456789abcdef",
+		ActorTemplateAtespace: "team-a",
+		ActorTemplateName:     "template-1",
+		RunscPath:             "/opt/runsc",
+		Spec:                  fullSpec(),
+		SnapshotUri:           "gs://bucket/root/atespaces/team-a/actors/uid/snapshots/1",
+		RuntimeAssetPaths:     map[string]string{"kata-kernel": "/opt/kernel"},
+		Scope:                 ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+		ActorDirs:             fullActorDirs(),
+	}
+	for _, m := range mutate {
+		m(r)
+	}
+	return r
+}
+
+// Checkpoint shares its identity and asset fields with Run, which the Run
+// table covers; this table holds the shared gates at one case each and
+// covers what only Checkpoint has: a scope that must be FULL or DATA, held
+// by a hook rather than the enum bound so the bound stays in sync with the enum.
 func TestValidateCheckpointWorkloadRequest(t *testing.T) {
-	for name, req := range map[string]*ateompb.CheckpointWorkloadRequest{
-		"empty": {},
-		"full": {
-			Atespace:              "team-a",
-			ActorName:             "actor-1",
-			ActorUid:              "01234567-89ab-cdef-0123-456789abcdef",
-			ActorTemplateAtespace: "team-a",
-			ActorTemplateName:     "template-1",
-			RunscPath:             "/opt/runsc",
-			Spec:                  fullSpec(),
-			SnapshotUri:           "gs://bucket/root/atespaces/team-a/actors/uid/snapshots/1",
-			RuntimeAssetPaths:     map[string]string{"kata-kernel": "/opt/kernel"},
-			Scope:                 ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
-			ActorDirs:             fullActorDirs(),
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if err := ValidateCheckpointWorkloadRequest(context.Background(), req); err != nil {
-				t.Fatalf("ValidateCheckpointWorkloadRequest() = %v, want nil", err)
+	valid := validCheckpointWorkloadRequest
+
+	tests := []struct {
+		name string
+		obj  *ateompb.CheckpointWorkloadRequest
+		want field.ErrorList
+	}{{
+		name: "valid",
+		obj:  valid(),
+	}, {
+		name: "valid: data scope, gVisor shape",
+		obj: valid(func(r *ateompb.CheckpointWorkloadRequest) {
+			r.Scope, r.RuntimeAssetPaths = ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA, nil
+		}),
+	}, {
+		name: "missing actor_uid",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.ActorUid = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("actor_uid"), "")},
+	}, {
+		name: "invalid actor_name: trailing dash",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.ActorName = "actor-" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "runsc_path too long",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.RunscPath = "/" + strings.Repeat("x", 4096) }),
+		want: field.ErrorList{field.TooLong(field.NewPath("runsc_path"), nil, 4096).WithOrigin("maxLength")},
+	}, {
+		name: "missing spec",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.Spec = nil }),
+		want: field.ErrorList{field.Required(field.NewPath("spec"), "")},
+	}, {
+		name: "missing snapshot_uri",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.SnapshotUri = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("snapshot_uri"), "")},
+	}, {
+		name: "invalid snapshot_uri: fragment",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.SnapshotUri = "gs://bucket/snapshots/1#frag" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("snapshot_uri"), nil, "")},
+	}, {
+		name: "too many runtime_asset_paths",
+		obj: valid(func(r *ateompb.CheckpointWorkloadRequest) {
+			r.RuntimeAssetPaths = map[string]string{}
+			for i := range 9 {
+				r.RuntimeAssetPaths[fmt.Sprintf("asset-%d", i)] = "/opt/asset"
 			}
+		}),
+		want: field.ErrorList{field.TooMany(field.NewPath("runtime_asset_paths"), 9, 8).WithOrigin("maxProperties")},
+	}, {
+		name: "missing scope",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.Scope = ateompb.SnapshotScope_SNAPSHOT_SCOPE_UNSPECIFIED }),
+		want: field.ErrorList{field.Required(field.NewPath("scope"), "")},
+	}, {
+		name: "scope past the enum",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.Scope = ateompb.SnapshotScope(3) }),
+		want: field.ErrorList{field.Invalid(field.NewPath("scope"), nil, "").WithOrigin("maximum")},
+	}, {
+		name: "missing actor_dirs",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.ActorDirs = nil }),
+		want: field.ErrorList{field.Required(field.NewPath("actor_dirs"), "")},
+	}, {
+		name: "relative checkpoint_dir",
+		obj:  valid(func(r *ateompb.CheckpointWorkloadRequest) { r.ActorDirs.CheckpointDir = "checkpoint" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_dirs", "checkpoint_dir"), nil, "")},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matcher := field.ErrorMatcher{}.ByType().ByField().ByOrigin()
+			matcher.Test(t, tt.want, Validate_CheckpointWorkloadRequest(context.Background(), createOp(), nil, tt.obj, nil))
+		})
+	}
+}
+
+// TestValidateCheckpointWorkloadRequestEdge covers the handler-facing
+// wrapper: valid passes, invalid comes back as InvalidArgument.
+func TestValidateCheckpointWorkloadRequestEdge(t *testing.T) {
+	if err := ValidateCheckpointWorkloadRequest(context.Background(), validCheckpointWorkloadRequest()); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	err := ValidateCheckpointWorkloadRequest(context.Background(), &ateompb.CheckpointWorkloadRequest{})
+	if apierror.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty request error = %v, want InvalidArgument", err)
+	}
+}
+
+// ActorDirs is reached from all four lifecycle requests; each request table
+// carries one case to show the path prefix, and this table holds the rules.
+func TestValidateActorDirs(t *testing.T) {
+	valid := func(mutate ...func(*ateompb.ActorDirs)) *ateompb.ActorDirs {
+		d := fullActorDirs()
+		for _, m := range mutate {
+			m(d)
+		}
+		return d
+	}
+	tests := []struct {
+		name string
+		obj  *ateompb.ActorDirs
+		want field.ErrorList
+	}{{
+		name: "valid",
+		obj:  valid(),
+	}, {
+		name: "missing root_dir",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.RootDir = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("root_dir"), "")},
+	}, {
+		name: "missing volumes_dir",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.VolumesDir = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("volumes_dir"), "")},
+	}, {
+		name: "relative oci_bundle_dir",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.OciBundleDir = "bundles" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("oci_bundle_dir"), nil, "")},
+	}, {
+		name: "unclean restore_dir",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.RestoreDir = "/actors/uid/../other/restore" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("restore_dir"), nil, "")},
+	}, {
+		name: "trailing slash on durable_dir_volume_mounts_dir",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.DurableDirVolumeMountsDir = "/actors/uid/durable/" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("durable_dir_volume_mounts_dir"), nil, "")},
+	}, {
+		name: "system_info_volume_roots_dir too long",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.SystemInfoVolumeRootsDir = "/" + strings.Repeat("x", 4096) }),
+		want: field.ErrorList{field.TooLong(field.NewPath("system_info_volume_roots_dir"), nil, 4096).WithOrigin("maxLength")},
+	}, {
+		name: "two bad dirs are both reported",
+		obj:  valid(func(d *ateompb.ActorDirs) { d.RootDir, d.CheckpointDir = "", "checkpoint" }),
+		want: field.ErrorList{
+			field.Required(field.NewPath("root_dir"), ""),
+			field.Invalid(field.NewPath("checkpoint_dir"), nil, ""),
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matcher := field.ErrorMatcher{}.ByType().ByField().ByOrigin()
+			matcher.Test(t, tt.want, Validate_ActorDirs(context.Background(), createOp(), nil, tt.obj, nil))
 		})
 	}
 }

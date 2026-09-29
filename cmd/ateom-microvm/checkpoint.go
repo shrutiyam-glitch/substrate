@@ -65,9 +65,6 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if err := ateomvalidation.ValidateCheckpointWorkloadRequest(ctx, req); err != nil {
 		return nil, err
 	}
-	if err := validateActorDirs(req.GetActorDirs()); err != nil {
-		return nil, err
-	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
 		return nil, fmt.Errorf("gave up waiting for the actor's lock: %w", ctx.Err())
 	}
@@ -388,9 +385,6 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, actorDirs *
 // networking and overlays.
 func (s *AteomService) TerminateWorkload(ctx context.Context, req *ateompb.TerminateWorkloadRequest) (*ateompb.TerminateWorkloadResponse, error) {
 	if err := ateomvalidation.ValidateTerminateWorkloadRequest(ctx, req); err != nil {
-		return nil, err
-	}
-	if err := validateActorDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
