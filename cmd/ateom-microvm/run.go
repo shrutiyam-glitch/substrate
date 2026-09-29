@@ -375,9 +375,6 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	// CreateContainer/StartContainer, driven below after the shared boot +
 	// CreateSandbox + guest networking.
 	containers := p.containers
-	if len(containers) == 0 {
-		return apierror.InvalidArgument("actor spec has no containers")
-	}
 	if len(containers) > maxActorContainers {
 		return apierror.Unimplemented("ateom-microvm supports at most %d containers, got %d", maxActorContainers, len(containers))
 	}

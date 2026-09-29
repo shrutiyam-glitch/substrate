@@ -265,9 +265,6 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// deterministic unpack of the same image at the same <cid>/rootfs path
 	// (plus, for merged rootfs, the upper re-materialized from the tar).
 	containers := p.containers
-	if len(containers) == 0 {
-		return apierror.InvalidArgument("actor spec has no containers")
-	}
 	if len(containers) > maxActorContainers {
 		return apierror.Unimplemented("ateom-microvm supports at most %d containers, got %d", maxActorContainers, len(containers))
 	}

@@ -26,8 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// Every request is validated; spec and egress_gateway are the message-typed
-// fields still opaque, and their contents get rules in follow-ups.
+// Every request is validated. Still opaque: egress_gateway, the wakeup probe,
+// and the items of the four mount lists; their contents get rules in
+// follow-ups.
 
 func fullSpec() *ateompb.WorkloadSpec {
 	return &ateompb.WorkloadSpec{Containers: []*ateompb.Container{{
@@ -158,6 +159,14 @@ func TestValidateRunWorkloadRequest(t *testing.T) {
 		name: "relative oci_bundle_dir",
 		obj:  valid(func(r *ateompb.RunWorkloadRequest) { r.ActorDirs.OciBundleDir = "bundles" }),
 		want: field.ErrorList{field.Invalid(field.NewPath("actor_dirs", "oci_bundle_dir"), nil, "")},
+	}, {
+		name: "empty spec",
+		obj:  valid(func(r *ateompb.RunWorkloadRequest) { r.Spec = &ateompb.WorkloadSpec{} }),
+		want: field.ErrorList{field.Required(field.NewPath("spec", "containers"), "")},
+	}, {
+		name: "bad container name",
+		obj:  valid(func(r *ateompb.RunWorkloadRequest) { r.Spec.Containers[0].Name = "Main" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("spec", "containers").Index(0).Child("name"), nil, "").WithOrigin("format=k8s-short-name")},
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -285,6 +294,120 @@ func TestValidateCheckpointWorkloadRequestEdge(t *testing.T) {
 	err := ValidateCheckpointWorkloadRequest(context.Background(), &ateompb.CheckpointWorkloadRequest{})
 	if apierror.Code(err) != codes.InvalidArgument {
 		t.Fatalf("empty request error = %v, want InvalidArgument", err)
+	}
+}
+
+// WorkloadSpec is reached from all four lifecycle requests; the Run table
+// carries one case to show the path prefix, and this table holds the rules.
+func TestValidateWorkloadSpec(t *testing.T) {
+	container := func(name string) *ateompb.Container { return &ateompb.Container{Name: name} }
+	tests := []struct {
+		name string
+		obj  *ateompb.WorkloadSpec
+		want field.ErrorList
+	}{{
+		name: "valid",
+		obj:  fullSpec(),
+	}, {
+		name: "valid: ten containers",
+		obj: func() *ateompb.WorkloadSpec {
+			spec := &ateompb.WorkloadSpec{}
+			for i := range 10 {
+				spec.Containers = append(spec.Containers, container(fmt.Sprintf("c-%d", i)))
+			}
+			return spec
+		}(),
+	}, {
+		name: "no containers",
+		obj:  &ateompb.WorkloadSpec{},
+		want: field.ErrorList{field.Required(field.NewPath("containers"), "")},
+	}, {
+		name: "too many containers",
+		obj: func() *ateompb.WorkloadSpec {
+			spec := &ateompb.WorkloadSpec{}
+			for i := range 11 {
+				spec.Containers = append(spec.Containers, container(fmt.Sprintf("c-%d", i)))
+			}
+			return spec
+		}(),
+		want: field.ErrorList{field.TooMany(field.NewPath("containers"), 11, 10).WithOrigin("maxItems")},
+	}, {
+		name: "duplicate container name",
+		obj:  &ateompb.WorkloadSpec{Containers: []*ateompb.Container{container("app"), container("app")}},
+		want: field.ErrorList{field.Duplicate(field.NewPath("containers").Index(1), nil)},
+	}, {
+		name: "nil container",
+		obj:  &ateompb.WorkloadSpec{Containers: []*ateompb.Container{nil}},
+		want: field.ErrorList{field.Required(field.NewPath("containers").Index(0), "")},
+	}, {
+		name: "bad name inside the list",
+		obj:  &ateompb.WorkloadSpec{Containers: []*ateompb.Container{container("app"), container("Sidecar")}},
+		want: field.ErrorList{field.Invalid(field.NewPath("containers").Index(1).Child("name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matcher := field.ErrorMatcher{}.ByType().ByField().ByOrigin()
+			matcher.Test(t, tt.want, Validate_WorkloadSpec(context.Background(), createOp(), nil, tt.obj, nil))
+		})
+	}
+}
+
+// The mount lists' items and the probe are still opaque; the list rules
+// (no nil entries, at most 32, unique mount paths) apply already.
+func TestValidateContainer(t *testing.T) {
+	valid := func(mutate ...func(*ateompb.Container)) *ateompb.Container {
+		c := fullSpec().Containers[0]
+		for _, m := range mutate {
+			m(c)
+		}
+		return c
+	}
+	tests := []struct {
+		name string
+		obj  *ateompb.Container
+		want field.ErrorList
+	}{{
+		name: "valid",
+		obj:  valid(),
+	}, {
+		name: "valid: name only",
+		obj:  &ateompb.Container{Name: "app"},
+	}, {
+		name: "missing name",
+		obj:  valid(func(c *ateompb.Container) { c.Name = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("name"), "")},
+	}, {
+		name: "invalid name: the sandbox's own container",
+		obj:  valid(func(c *ateompb.Container) { c.Name = "_pause" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "too many csi mounts",
+		obj: valid(func(c *ateompb.Container) {
+			c.CsiVolumeMounts = nil
+			for i := range 33 {
+				c.CsiVolumeMounts = append(c.CsiVolumeMounts, &ateompb.VolumeMount{VolumeName: "v", MountPath: fmt.Sprintf("/m/%d", i)})
+			}
+		}),
+		want: field.ErrorList{field.TooMany(field.NewPath("csi_volume_mounts"), 33, 32).WithOrigin("maxItems")},
+	}, {
+		name: "duplicate durable-dir mount path",
+		obj: valid(func(c *ateompb.Container) {
+			c.DurableDirVolumeMounts = []*ateompb.DurableDirVolumeMount{{VolumeName: "a", MountPath: "/data"}, {VolumeName: "b", MountPath: "/data"}}
+		}),
+		want: field.ErrorList{field.Duplicate(field.NewPath("durable_dir_volume_mounts").Index(1), nil)},
+	}, {
+		name: "nil image mount",
+		obj:  valid(func(c *ateompb.Container) { c.ImageVolumeMounts = []*ateompb.ImageVolumeMount{nil} }),
+		want: field.ErrorList{field.Required(field.NewPath("image_volume_mounts").Index(0), "")},
+	}, {
+		name: "opaque: an empty system-info mount passes for now",
+		obj:  valid(func(c *ateompb.Container) { c.SystemInfoVolumeMounts = []*ateompb.SystemInfoVolumeMount{{}} }),
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matcher := field.ErrorMatcher{}.ByType().ByField().ByOrigin()
+			matcher.Test(t, tt.want, Validate_Container(context.Background(), createOp(), nil, tt.obj, nil))
+		})
 	}
 }
 
