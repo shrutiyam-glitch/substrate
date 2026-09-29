@@ -1,0 +1,90 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ateomvalidation
+
+import (
+	"context"
+	"reflect"
+
+	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/proto/ateompb"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/operation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+// Each wrapper validates its request at the RPC edge. A non-nil return is the
+// InvalidArgument error the handler responds with. Requests are validated as
+// creates: no Ateom RPC updates prior state, so there is nothing to ratchet
+// against.
+
+// ValidateRunWorkloadRequest validates req at the RPC edge.
+func ValidateRunWorkloadRequest(ctx context.Context, req *ateompb.RunWorkloadRequest) error {
+	return toInvalidArgument(Validate_RunWorkloadRequest(ctx, createOp(), nil, req, nil))
+}
+
+// ValidateCheckpointWorkloadRequest validates req at the RPC edge.
+func ValidateCheckpointWorkloadRequest(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) error {
+	return toInvalidArgument(Validate_CheckpointWorkloadRequest(ctx, createOp(), nil, req, nil))
+}
+
+// ValidateRestoreWorkloadRequest validates req at the RPC edge.
+func ValidateRestoreWorkloadRequest(ctx context.Context, req *ateompb.RestoreWorkloadRequest) error {
+	return toInvalidArgument(Validate_RestoreWorkloadRequest(ctx, createOp(), nil, req, nil))
+}
+
+// ValidateTerminateWorkloadRequest validates req at the RPC edge.
+func ValidateTerminateWorkloadRequest(ctx context.Context, req *ateompb.TerminateWorkloadRequest) error {
+	return toInvalidArgument(Validate_TerminateWorkloadRequest(ctx, createOp(), nil, req, nil))
+}
+
+// ValidateGetWorkloadStatsRequest validates req at the RPC edge.
+func ValidateGetWorkloadStatsRequest(ctx context.Context, req *ateompb.GetWorkloadStatsRequest) error {
+	return toInvalidArgument(Validate_GetWorkloadStatsRequest(ctx, createOp(), nil, req, nil))
+}
+
+// GetActiveWorkloadStatsRequest has no fields, so validation-gen emits
+// nothing for it and there is no wrapper.
+
+func createOp() operation.Operation {
+	return operation.Operation{Type: operation.Create}
+}
+
+func toInvalidArgument(errs field.ErrorList) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return apierror.InvalidArgument("%v", errs.ToAggregate())
+}
+
+// ateDeepEqual compares two values of any type, using proto.Equal if both are
+// proto messages, and reflect.DeepEqual otherwise. This is called by
+// declarative validation's generated code. It is a copy of controlapi's
+// ateDeepEqual: the generated code calls it as a package-level identifier, so
+// each generating package carries its own.
+func ateDeepEqual[T any](a, b T) bool {
+	asProto := func(x any) proto.Message {
+		pm, ok := x.(proto.Message)
+		if !ok {
+			return nil
+		}
+		return pm
+	}
+
+	if pa, pb := asProto(a), asProto(b); pa != nil && pb != nil {
+		return proto.Equal(pa, pb)
+	}
+	return reflect.DeepEqual(a, b)
+}
