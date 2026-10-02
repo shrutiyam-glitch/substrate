@@ -280,7 +280,7 @@ message Container {
   // +k8s:maxItems=32 # matches the template's volume_mounts bound
   // +k8s:listType=map
   // +k8s:listMapKey=mount_path
-  // +k8s:opaqueType # tagged in a follow-up
+  // +k8s:customValidation # mounts must not nest
   repeated DurableDirVolumeMount durable_dir_volume_mounts = 3;
 
   // csi_volume_mounts are the CSI volumes this container mounts, if any.
@@ -289,7 +289,7 @@ message Container {
   // +k8s:maxItems=32 # matches the template's volume_mounts bound
   // +k8s:listType=map
   // +k8s:listMapKey=mount_path
-  // +k8s:opaqueType # tagged in a follow-up
+  // +k8s:customValidation # mounts must not nest
   repeated VolumeMount csi_volume_mounts = 4;
 
   // system_info_volume_mounts are the system-info volumes this container
@@ -300,7 +300,7 @@ message Container {
   // +k8s:maxItems=32 # matches the template's volume_mounts bound
   // +k8s:listType=map
   // +k8s:listMapKey=mount_path
-  // +k8s:opaqueType # tagged in a follow-up
+  // +k8s:customValidation # mounts must not nest
   repeated SystemInfoVolumeMount system_info_volume_mounts = 5;
 
   // image_volume_mounts are the image volumes this container mounts, if any.
@@ -309,13 +309,23 @@ message Container {
   // +k8s:maxItems=32 # matches the template's volume_mounts bound
   // +k8s:listType=map
   // +k8s:listMapKey=mount_path
-  // +k8s:opaqueType # tagged in a follow-up
+  // +k8s:customValidation # mounts must not nest
   repeated ImageVolumeMount image_volume_mounts = 6;
 }
 
 // VolumeMount is one volume mounted into a container.
 message VolumeMount {
+  // volume_name is the name the ActorTemplate gave the volume.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
   string volume_name = 1;
+  // mount_path is where the container sees the volume. Must be a clean
+  // absolute Unix path.
+  //
+  // +k8s:required
+  // +k8s:maxLength=4096
+  // +k8s:customValidation # clean-absolute-path shape; no regex/pattern tag exists
   string mount_path = 2;
 }
 
@@ -323,8 +333,15 @@ message VolumeMount {
 message DurableDirVolumeMount {
   // volume_name is the name the ActorTemplate gave the volume. It selects the
   // per-volume directory atelet prepared for the actor on the host.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
   string volume_name = 1;
   // mount_path is where the container sees the volume.
+  //
+  // +k8s:required
+  // +k8s:maxLength=4096
+  // +k8s:customValidation # clean-absolute-path shape; no regex/pattern tag exists
   string mount_path = 2;
 }
 
@@ -334,8 +351,15 @@ message DurableDirVolumeMount {
 message SystemInfoVolumeMount {
   // volume_name is the name the ActorTemplate gave the volume. It selects the
   // per-volume directory atelet prepared for the actor on the host.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
   string volume_name = 1;
   // mount_path is where the container sees the volume.
+  //
+  // +k8s:required
+  // +k8s:maxLength=4096
+  // +k8s:customValidation # clean-absolute-path shape; no regex/pattern tag exists
   string mount_path = 2;
 }
 
@@ -344,8 +368,15 @@ message SystemInfoVolumeMount {
 // and its destination path.
 message ImageVolumeMount {
   // volume_name is the name the ActorTemplate gave the volume.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
   string volume_name = 1;
   // mount_path is where the container sees the volume.
+  //
+  // +k8s:required
+  // +k8s:maxLength=4096
+  // +k8s:customValidation # clean-absolute-path shape; no regex/pattern tag exists
   string mount_path = 2;
 }
 

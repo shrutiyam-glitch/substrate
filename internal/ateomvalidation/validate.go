@@ -86,6 +86,61 @@ func ValidateCustom_HTTPGetAction_Path(_ context.Context, _ operation.Operation,
 	return resources.ValidateHTTPGetPath(fldPath, *value)
 }
 
+// The four mount messages share one mount_path rule: a clean absolute Unix
+// path, the shape atelet already enforces, shared through internal/resources.
+
+func ValidateCustom_VolumeMount_MountPath(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateMountPath(fldPath, *value)
+}
+
+func ValidateCustom_DurableDirVolumeMount_MountPath(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateMountPath(fldPath, *value)
+}
+
+func ValidateCustom_SystemInfoVolumeMount_MountPath(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateMountPath(fldPath, *value)
+}
+
+func ValidateCustom_ImageVolumeMount_MountPath(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateMountPath(fldPath, *value)
+}
+
+// The four mount lists each reject nested mounts, as atelet does for its one
+// list: volumes cannot mount onto other volumes. Mount-path uniqueness within
+// a list is the list key's job.
+
+func ValidateCustom_Container_DurableDirVolumeMounts(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []*ateompb.DurableDirVolumeMount) field.ErrorList {
+	paths := make([]string, len(value))
+	for i, m := range value {
+		paths[i] = m.GetMountPath()
+	}
+	return resources.ValidateNestedMountPaths(fldPath, paths)
+}
+
+func ValidateCustom_Container_CsiVolumeMounts(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []*ateompb.VolumeMount) field.ErrorList {
+	paths := make([]string, len(value))
+	for i, m := range value {
+		paths[i] = m.GetMountPath()
+	}
+	return resources.ValidateNestedMountPaths(fldPath, paths)
+}
+
+func ValidateCustom_Container_SystemInfoVolumeMounts(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []*ateompb.SystemInfoVolumeMount) field.ErrorList {
+	paths := make([]string, len(value))
+	for i, m := range value {
+		paths[i] = m.GetMountPath()
+	}
+	return resources.ValidateNestedMountPaths(fldPath, paths)
+}
+
+func ValidateCustom_Container_ImageVolumeMounts(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []*ateompb.ImageVolumeMount) field.ErrorList {
+	paths := make([]string, len(value))
+	for i, m := range value {
+		paths[i] = m.GetMountPath()
+	}
+	return resources.ValidateNestedMountPaths(fldPath, paths)
+}
+
 // ValidateCustom_ActorDirs holds every directory to an absolute, clean path.
 // Presence and length are the tags' job. The rule is the one both ateom
 // binaries applied by hand before, shared through internal/resources.
