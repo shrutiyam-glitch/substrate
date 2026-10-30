@@ -495,7 +495,7 @@ func TestDeleteRunningActorWithExternalVolume(t *testing.T) {
 
 	// Delete the running actor
 	t.Logf("Deleting running Actor %q...", actorName)
-	if _, err := clients.SubstrateAPI.DeleteActor(ctx, &ateapi.DeleteActorRequest{
+	if _, err := e2e.RetryAborted(t, ctx, clients.SubstrateAPI.DeleteActor, &ateapi.DeleteActorRequest{
 		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorName},
 	}); err != nil {
 		t.Fatalf("failed to delete Actor: %v", err)
@@ -592,7 +592,7 @@ func TestExternalVolume_NodeMigration(t *testing.T) {
 
 	// Clean up by deleting the actor
 	t.Logf("Deleting Actor %q...", actorName)
-	if _, err := clients.SubstrateAPI.DeleteActor(ctx, &ateapi.DeleteActorRequest{
+	if _, err := e2e.RetryAborted(t, ctx, clients.SubstrateAPI.DeleteActor, &ateapi.DeleteActorRequest{
 		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorName},
 	}); err != nil {
 		t.Fatalf("failed to delete Actor: %v", err)
@@ -1512,7 +1512,7 @@ func deleteRunningActor(ctx context.Context, t *testing.T, clients *e2e.Clients,
 
 	// 3. Delete the running actor
 	t.Logf("Deleting running Actor %q...", actorName)
-	if _, err := clients.SubstrateAPI.DeleteActor(ctx, &ateapi.DeleteActorRequest{
+	if _, err := e2e.RetryAborted(t, ctx, clients.SubstrateAPI.DeleteActor, &ateapi.DeleteActorRequest{
 		Actor: &ateapi.ObjectRef{Atespace: demoAtespace, Name: actorName},
 	}); err != nil {
 		t.Fatalf("failed to delete Actor: %v", err)
