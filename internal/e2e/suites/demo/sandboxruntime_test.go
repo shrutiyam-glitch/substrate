@@ -17,6 +17,7 @@ package demo
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -192,6 +193,81 @@ func TestTagCloneOnDisabledVersion(t *testing.T) {
 	// 3. A clone of the Tag drops to ROOTFS on v2.
 	clone := f.cloneFromTag(t, tagRef, "clone-"+f.actorName)
 	clone.resumeAndCheck(t, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, hardware.ColdBootRuntime(status))
+}
+
+// TestSchedulerPrefersCompatibleWorkerPool covers placement across two
+// WorkerPools that match the same ActorTemplate selector:
+//  1. An actor boots on poolA (configA at v1), increments its counters twice
+//     (memory=2, file=2, rootfs=2), and suspends with a v1-stamped MEMORY
+//     snapshot.
+//  2. A second pool, poolB (configB at v2), starts in the same namespace with
+//     the same labels and reaches WORKER_STATE_ACTIVE.
+//  3. With both pools free, the resume picks poolA's worker, the only one
+//     advertising v1, and restores MEMORY (memory=3, file=3, rootfs=3).
+//  4. configA disables v1, so neither pool advertises it; the next resume
+//     drops to ROOTFS on v2 (memory=1, file=4, rootfs=4).
+func TestSchedulerPrefersCompatibleWorkerPool(t *testing.T) {
+	t.Parallel()
+	f := setupSuspendedV1Actor(t, "prefer-pool")
+
+	// 2. configB holds v2 alone; poolB copies poolA apart from its configRef.
+	configBName := f.configName + "-b"
+	if _, err := f.clients.SubstrateK8s.AteV1().SandboxConfigs().Create(f.ctx, &atev1.SandboxConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: configBName},
+		Spec: atev1.SandboxConfigSpec{
+			SandboxClass:   f.class,
+			DefaultVersion: f.v2.Name,
+			Versions:       []atev1.SandboxVersionConfig{f.v2},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create SandboxConfig %s: %v", configBName, err)
+	}
+	poolA, err := f.clients.SubstrateK8s.AteV1().WorkerPools(f.namespace).Get(f.ctx, f.poolName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get WorkerPool %s/%s: %v", f.namespace, f.poolName, err)
+	}
+	sandboxClassesB := slices.Clone(poolA.Spec.SandboxClasses)
+	for i := range sandboxClassesB {
+		sandboxClassesB[i].ConfigRef = &atev1.SandboxConfigReference{Name: configBName}
+	}
+	poolBName := f.poolName + "-b"
+	if _, err := f.clients.SubstrateK8s.AteV1().WorkerPools(f.namespace).Create(f.ctx, &atev1.WorkerPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      poolBName,
+			Namespace: f.namespace,
+			Labels:    poolA.Labels,
+		},
+		Spec: atev1.WorkerPoolSpec{
+			Replicas:       1,
+			WorkerImage:    poolA.Spec.WorkerImage,
+			SandboxClasses: sandboxClassesB,
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create WorkerPool %s/%s: %v", f.namespace, poolBName, err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_ = f.clients.SubstrateK8s.AteV1().WorkerPools(f.namespace).Delete(cleanupCtx, poolBName, metav1.DeleteOptions{})
+		if err := f.clients.SubstrateK8s.AteV1().SandboxConfigs().Delete(cleanupCtx, configBName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("failed to delete SandboxConfig %s: %v", configBName, err)
+		}
+	})
+	v2Runtime := f.waitForPoolWorker(t, poolBName)
+
+	// 3. Both pools are free; only poolA's worker can restore v1.
+	assignment := f.resumeAndCheck(t, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, f.v1Runtime).GetWorkerAssignment()
+	if got := assignment.GetWorker().GetName(); got != f.workerRef.GetName() {
+		t.Fatalf("assigned worker = %q (pool %q), want poolA's worker %q", got, assignment.GetWorkerPool(), f.workerRef.GetName())
+	}
+
+	// 4. Disable v1 on configA, so no pool advertises it.
+	f.updateVersions(t, f.v2.Name, []atev1.SandboxVersionConfig{withState(f.v1, atev1.SandboxVersionStateDisabled), f.v2})
+	f.waitForWorker(t, func(status *ateapi.WorkerStatus) bool {
+		defHash := runtimeAttribute(hardware.ColdBootRuntime(status), hardware.AttrSandboxBundleHash)
+		return defHash != "" && defHash != f.v1Hash && !hardware.WorkerMatches(status, f.v1Runtime)
+	})
+	f.resumeAndCheck(t, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, v2Runtime)
 }
 
 // sandboxRuntimeFixture is a suspended actor on a pool whose SandboxConfig
@@ -534,6 +610,42 @@ func (f *sandboxRuntimeFixture) repoint(t *testing.T) {
 		},
 	}); err != nil {
 		t.Fatalf("failed to update Actor %s to template %s: %v", f.actorName, name, err)
+	}
+}
+
+// waitForPoolWorker polls ListWorkers until a worker of poolName in the
+// fixture's namespace is ACTIVE on a default_runtime other than v1, and
+// returns that runtime.
+func (f *sandboxRuntimeFixture) waitForPoolWorker(t *testing.T, poolName string) *ateapi.ActorSandboxRuntime {
+	t.Helper()
+	const timeout = 2 * time.Minute
+	ctx, cancel := context.WithTimeout(f.ctx, timeout)
+	defer cancel()
+
+	var last *ateapi.Worker
+	for {
+		resp, err := f.clients.SubstrateAPI.ListWorkers(ctx, &ateapi.ListWorkersRequest{})
+		if err == nil {
+			for _, w := range resp.GetWorkers() {
+				if w.GetWorkerNamespace() != f.namespace || w.GetWorkerPool() != poolName {
+					continue
+				}
+				last = w
+				status := w.GetStatus()
+				defRuntime := hardware.ColdBootRuntime(status)
+				defHash := runtimeAttribute(defRuntime, hardware.AttrSandboxBundleHash)
+				if status.GetState() == ateapi.WorkerState_WORKER_STATE_ACTIVE && defHash != "" && defHash != f.v1Hash && !hardware.WorkerMatches(status, f.v1Runtime) {
+					return defRuntime
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			raw, _ := json.Marshal(last)
+			t.Fatalf("timed out after %v waiting for pool %s/%s to have an ACTIVE worker off v1 (last worker=%s, err=%v)",
+				timeout, f.namespace, poolName, raw, err)
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
