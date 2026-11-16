@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"testing"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
@@ -536,6 +537,16 @@ type fleet []*ateapi.Worker
 
 func (f fleet) Workers() ([]*ateapi.Worker, error) { return f, nil }
 
+func (f fleet) WorkersOnNodes(nodes []string) ([]*ateapi.Worker, error) {
+	var out []*ateapi.Worker
+	for _, w := range f {
+		if slices.Contains(nodes, w.GetNodeName()) {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
 func worker(pod, class, node string, lbls map[string]string, opts ...func(*ateapi.Worker)) *ateapi.Worker {
 	w := &ateapi.Worker{
 		WorkerPod: pod,
@@ -796,5 +807,54 @@ func TestHasRoomBooksRuntimeOverhead(t *testing.T) {
 	}
 	if !s.HasRoom(roomy, constraints) {
 		t.Error("HasRoom() = false with room for the actor and its overhead, want true")
+	}
+}
+
+type spyWorkerSource struct {
+	fleet
+	workersCalls        int
+	workersOnNodesCalls int
+	lastNodes           []string
+}
+
+func (s *spyWorkerSource) Workers() ([]*ateapi.Worker, error) {
+	s.workersCalls++
+	return s.fleet.Workers()
+}
+
+func (s *spyWorkerSource) WorkersOnNodes(nodes []string) ([]*ateapi.Worker, error) {
+	s.workersOnNodesCalls++
+	s.lastNodes = slices.Clone(nodes)
+	return s.fleet.WorkersOnNodes(nodes)
+}
+
+func TestScheduleQueriesByNodeWhenRequiredNodesSet(t *testing.T) {
+	src := &spyWorkerSource{
+		fleet: fleet{
+			worker("w-a", "gvisor", "node-a", nil),
+			worker("w-b", "gvisor", "node-b", nil),
+		},
+	}
+	s := New(src)
+
+	got, err := s.Schedule(context.Background(), Constraints{RequiredNodes: []string{"node-b"}})
+	if err != nil {
+		t.Fatalf("pinned Schedule() error = %v", err)
+	}
+	if got.GetWorkerPod() != "w-b" {
+		t.Fatalf("pinned Schedule() = %s, want w-b", got.GetWorkerPod())
+	}
+	if src.workersOnNodesCalls != 1 || src.workersCalls != 0 {
+		t.Fatalf("pinned calls = (Workers=%d, WorkersOnNodes=%d), want (0, 1)", src.workersCalls, src.workersOnNodesCalls)
+	}
+	if !slices.Equal(src.lastNodes, []string{"node-b"}) {
+		t.Fatalf("WorkersOnNodes called with %v, want [node-b]", src.lastNodes)
+	}
+
+	if _, err := s.Schedule(context.Background(), Constraints{}); err != nil {
+		t.Fatalf("unpinned Schedule() error = %v", err)
+	}
+	if src.workersCalls != 1 || src.workersOnNodesCalls != 1 {
+		t.Fatalf("unpinned calls = (Workers=%d, WorkersOnNodes=%d), want (1, 1)", src.workersCalls, src.workersOnNodesCalls)
 	}
 }

@@ -86,9 +86,11 @@ type Scheduler interface {
 	HasRoom(worker *ateapi.Worker, constraints Constraints) bool
 }
 
-// WorkerSource provides the whole fleet of workers.
+// WorkerSource provides the whole fleet of workers, or only those on specific
+// nodes.
 type WorkerSource interface {
 	Workers() ([]*ateapi.Worker, error)
+	WorkersOnNodes(nodes []string) ([]*ateapi.Worker, error)
 }
 
 type scheduler struct {
@@ -116,12 +118,19 @@ func New(source WorkerSource, opts ...Option) Scheduler {
 	return s
 }
 
+func (s *scheduler) workersFor(constraints Constraints) ([]*ateapi.Worker, error) {
+	if len(constraints.RequiredNodes) > 0 {
+		return s.source.WorkersOnNodes(constraints.RequiredNodes)
+	}
+	return s.source.Workers()
+}
+
 // Schedule filters the fleet for eligible candidates with room, samples two at
 // random (power of two choices), and returns the less-loaded one, where load is
 // the higher of actor-slot and compute-resource utilization. Spreading across
 // the warm pool avoids hotspots until autoscaling reclaims idle workers.
 func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ateapi.Worker, error) {
-	workers, err := s.source.Workers()
+	workers, err := s.workersFor(constraints)
 	if err != nil {
 		return nil, fmt.Errorf("while listing workers: %w", err)
 	}

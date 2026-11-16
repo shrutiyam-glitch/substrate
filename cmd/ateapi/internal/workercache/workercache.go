@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,7 @@ type Cache struct {
 
 	mu       sync.RWMutex
 	workers  map[string]*ateapi.Worker
+	byNode   map[string]map[string]*ateapi.Worker
 	handlers []func(*ateapi.Worker)
 
 	ready atomic.Bool
@@ -84,6 +86,7 @@ func New(store workerListWatcher, relistInterval time.Duration) *Cache {
 		store:          store,
 		relistInterval: relistInterval,
 		workers:        make(map[string]*ateapi.Worker),
+		byNode:         make(map[string]map[string]*ateapi.Worker),
 	}
 }
 
@@ -124,6 +127,36 @@ func (c *Cache) Workers() ([]*ateapi.Worker, error) {
 	return out, nil
 }
 
+// WorkersOnNodes returns a snapshot of currently known workers running on any
+// of nodes. The returned slice and its elements must not be modified by the
+// caller. Returns an error if the cache is not ready.
+func (c *Cache) WorkersOnNodes(nodes []string) ([]*ateapi.Worker, error) {
+	if !c.ready.Load() {
+		return nil, fmt.Errorf("worker cache not ready")
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var total int
+	for i, node := range nodes {
+		if !slices.Contains(nodes[:i], node) {
+			total += len(c.byNode[node])
+		}
+	}
+	if total == 0 {
+		return nil, nil
+	}
+	out := make([]*ateapi.Worker, 0, total)
+	for i, node := range nodes {
+		if slices.Contains(nodes[:i], node) {
+			continue
+		}
+		for _, w := range c.byNode[node] {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
 // Worker returns the worker with the given name.
 func (c *Cache) Worker(name string) (*ateapi.Worker, error) {
 	if !c.ready.Load() {
@@ -145,7 +178,10 @@ func (c *Cache) Worker(name string) (*ateapi.Worker, error) {
 func (c *Cache) Forget(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.workers, name)
+	if existing, ok := c.workers[name]; ok {
+		deleteFromNode(c.byNode, existing.GetNodeName(), name)
+		delete(c.workers, name)
+	}
 }
 
 func (c *Cache) sync(ctx context.Context) (*store.WorkerWatch, error) {
@@ -175,8 +211,11 @@ func (c *Cache) relist(ctx context.Context) error {
 		pageToken = page.NextPageToken
 	}
 	newMap := make(map[string]*ateapi.Worker, len(workers))
+	newByNode := make(map[string]map[string]*ateapi.Worker)
 	for _, w := range workers {
-		newMap[workerKey(w)] = w
+		key := workerKey(w)
+		newMap[key] = w
+		addToNode(newByNode, key, w)
 	}
 	c.mu.Lock()
 	var changed []*ateapi.Worker
@@ -187,6 +226,7 @@ func (c *Cache) relist(ctx context.Context) error {
 		}
 	}
 	c.workers = newMap
+	c.byNode = newByNode
 	handlers := c.handlers
 	c.mu.Unlock()
 	slog.InfoContext(ctx, "worker cache synced", slog.Int("count", len(newMap)), slog.Int("changed", len(changed)))
@@ -253,16 +293,41 @@ func (c *Cache) applyEvent(event store.WorkerEvent) {
 	var handlers []func(*ateapi.Worker)
 	switch event.Type {
 	case store.WorkerEventDeleted:
-		delete(c.workers, key)
+		if existing, ok := c.workers[key]; ok {
+			deleteFromNode(c.byNode, existing.GetNodeName(), key)
+			delete(c.workers, key)
+		}
 	case store.WorkerEventCreated, store.WorkerEventUpdated:
 		existing, ok := c.workers[key]
 		if !ok || event.Worker.GetMetadata().GetVersion() >= existing.GetMetadata().GetVersion() {
+			if ok && existing.GetNodeName() != event.Worker.GetNodeName() {
+				deleteFromNode(c.byNode, existing.GetNodeName(), key)
+			}
 			c.workers[key] = event.Worker
+			addToNode(c.byNode, key, event.Worker)
 			handlers = c.handlers
 		}
 	}
 	c.mu.Unlock()
 	notify(handlers, event.Worker)
+}
+
+func addToNode(byNode map[string]map[string]*ateapi.Worker, key string, w *ateapi.Worker) {
+	node := w.GetNodeName()
+	m := byNode[node]
+	if m == nil {
+		m = make(map[string]*ateapi.Worker)
+		byNode[node] = m
+	}
+	m[key] = w
+}
+
+func deleteFromNode(byNode map[string]map[string]*ateapi.Worker, node, key string) {
+	m := byNode[node]
+	delete(m, key)
+	if len(m) == 0 {
+		delete(byNode, node)
+	}
 }
 
 func workerKey(w *ateapi.Worker) string {

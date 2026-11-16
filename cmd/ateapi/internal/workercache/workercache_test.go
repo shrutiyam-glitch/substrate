@@ -36,6 +36,9 @@ func TestCache_NotReadyBeforeStart(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from Workers before Start, got nil")
 	}
+	if _, err := c.WorkersOnNodes([]string{"node-a"}); err == nil {
+		t.Fatal("expected error from WorkersOnNodes before Start, got nil")
+	}
 	if _, err := c.Worker(workerName("ns", "pod")); err == nil {
 		t.Fatal("expected error from Worker before Start, got nil")
 	}
@@ -606,5 +609,99 @@ func TestCache_AddHandler_SeesRelistChanges(t *testing.T) {
 	}
 	if diff := cmp.Diff([]int64{1}, h.versions(workerName("ns", "pod3"))); diff != "" {
 		t.Errorf("pod3 versions (-want +got):\n%s", diff)
+	}
+}
+
+func makeWorkerOnNode(namespace, pod, node string, version int64) *ateapi.Worker {
+	w := makeWorker(namespace, pod, version)
+	w.NodeName = node
+	return w
+}
+
+func TestCache_WorkersOnNodes(t *testing.T) {
+	wA1 := makeWorkerOnNode("ns", "pod-a1", "node-a", 1)
+	wB1 := makeWorkerOnNode("ns", "pod-b1", "node-b", 1)
+	fs := newFakeStore(wA1, wB1)
+	c := workercache.New(fs, time.Hour)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	assertNode := func(nodes []string, want ...*ateapi.Worker) {
+		t.Helper()
+		got, err := c.WorkersOnNodes(nodes)
+		if err != nil {
+			t.Fatalf("WorkersOnNodes(%v): %v", nodes, err)
+		}
+		if diff := cmp.Diff(want, got, protocmp.Transform(), workerSortOpt); diff != "" {
+			t.Errorf("WorkersOnNodes(%v) mismatch (-want +got):\n%s", nodes, diff)
+		}
+	}
+
+	// Duplicate node names in the query must not duplicate returned workers.
+	assertNode([]string{"node-a", "node-a"}, wA1)
+	assertNode([]string{"node-a", "node-b"}, wA1, wB1)
+	assertNode([]string{"missing"})
+
+	// Create and update on node-a, plus node move on version bump.
+	wA2 := makeWorkerOnNode("ns", "pod-a2", "node-a", 1)
+	fs.send(store.WorkerEvent{Type: store.WorkerEventCreated, Worker: wA2})
+	eventually(t, func() bool {
+		got, err := c.WorkersOnNodes([]string{"node-a"})
+		return err == nil && len(got) == 2
+	}, 2*time.Second)
+	assertNode([]string{"node-a"}, wA1, wA2)
+
+	wA1Moved := makeWorkerOnNode("ns", "pod-a1", "node-c", 2)
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: wA1Moved})
+	eventually(t, func() bool {
+		got, err := c.WorkersOnNodes([]string{"node-c"})
+		return err == nil && len(got) == 1
+	}, 2*time.Second)
+	assertNode([]string{"node-a"}, wA2)
+	assertNode([]string{"node-c"}, wA1Moved)
+
+	// Delete event removes from byNode even if delete tombstone lacks NodeName.
+	fs.send(store.WorkerEvent{Type: store.WorkerEventDeleted, Worker: makeWorker("ns", "pod-a2", 2)})
+	eventually(t, func() bool {
+		got, err := c.WorkersOnNodes([]string{"node-a"})
+		return err == nil && len(got) == 0
+	}, 2*time.Second)
+	assertNode([]string{"node-a"})
+
+	// Forget removes from both Workers and WorkersOnNodes.
+	c.Forget(workerName("ns", "pod-b1"))
+	assertNode([]string{"node-b"})
+	all, err := c.Workers()
+	if err != nil {
+		t.Fatalf("Workers: %v", err)
+	}
+	if diff := cmp.Diff([]*ateapi.Worker{wA1Moved}, all, protocmp.Transform(), workerSortOpt); diff != "" {
+		t.Errorf("Workers after Forget mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestCache_WorkersOnNodes_Relist(t *testing.T) {
+	wA := makeWorkerOnNode("ns", "pod-a", "node-a", 1)
+	fs := newFakeStore(wA)
+	c := workercache.New(fs, 10*time.Millisecond)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	wB := makeWorkerOnNode("ns", "pod-b", "node-b", 1)
+	fs.setWorkers(wB)
+	eventually(t, func() bool {
+		gotA, errA := c.WorkersOnNodes([]string{"node-a"})
+		gotB, errB := c.WorkersOnNodes([]string{"node-b"})
+		return errA == nil && len(gotA) == 0 && errB == nil && len(gotB) == 1
+	}, 2*time.Second)
+
+	gotB, err := c.WorkersOnNodes([]string{"node-b"})
+	if err != nil {
+		t.Fatalf("WorkersOnNodes(node-b): %v", err)
+	}
+	if diff := cmp.Diff([]*ateapi.Worker{wB}, gotB, protocmp.Transform(), workerSortOpt); diff != "" {
+		t.Errorf("WorkersOnNodes(node-b) mismatch (-want +got):\n%s", diff)
 	}
 }
